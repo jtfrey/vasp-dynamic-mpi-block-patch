@@ -62,7 +62,7 @@ The runtime output reflects this choice:
 ```
    :
  =============================================================
- Using MPI_BLOCK size 131072 byte(s) from environment
+ Using MPI_BLOCK size 131072 word(s) from environment
  MPI complex work array allocated using MPI_BLOCK
          (with real/integer/logical equivalences)
  running  256 mpi-ranks, with    1 threads/rank, on    4 nodes
