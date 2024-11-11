@@ -115,12 +115,12 @@ diff -Naur A/mpi.F B/mpi.F
 +
 +#   if defined(IFC) || defined(MPI_WORK_ARRAY_EQUIVALENCE)
 +              ! Pointer-based equivalence between work arrays:
-+              CALL C_F_POINTER(C_LOC(ZTMP_m), DTMP_m, (/NDTMP/))
-+              CALL C_F_POINTER(C_LOC(ZTMP_m), ITMP_m, (/NITMP/))
-+              CALL C_F_POINTER(C_LOC(ZTMP_m), LTMP_m, (/NLTMP/))
 +              NDTMP = MPI_BLOCK_VALUE
++              CALL C_F_POINTER(C_LOC(ZTMP_m), DTMP_m, (/NDTMP/))
 +              NITMP = MPI_BLOCK_VALUE
++              CALL C_F_POINTER(C_LOC(ZTMP_m), ITMP_m, (/NITMP/))
 +              NLTMP = MPI_BLOCK_VALUE
++              CALL C_F_POINTER(C_LOC(ZTMP_m), LTMP_m, (/NLTMP/))
 +              IF (COMM%NODE_ME .EQ. 1) THEN
 +                  WRITE(0,*) 'MPI complex work array allocated using MPI_BLOCK'
 +                  WRITE(0,*) '        (with real/integer/logical equivalences)'
