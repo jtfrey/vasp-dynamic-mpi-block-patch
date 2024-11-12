@@ -1,0 +1,309 @@
+diff -Naur A/mpi.F B/mpi.F
+--- A/mpi.F	2024-11-12 10:02:36.596299748 -0500
++++ B/mpi.F	2024-11-12 10:17:37.134165883 -0500
+@@ -123,28 +123,134 @@
+ #ifdef MPI_INPLACE
+ ! FIXME: check what M_cycle_d does with the intermediate array.
+ ! REDUCEALL routines no longer use intermediate arrays
+-      INTEGER,PARAMETER ::  NDTMP=MPI_BLOCK
+-! workspace for real operations
+-      REAL(q),SAVE    :: DTMP_m(NDTMP)
++      INTEGER :: NDTMP
++!> workspace for real operations
++      REAL(q), DIMENSION(:), ALLOCATABLE :: DTMP_m
+ #else
+ ! There are no global local sum routines in MPI, thus some workspace
+ ! is required to store the results of the global sum
+-      INTEGER,PARAMETER ::  NZTMP=MPI_BLOCK/2, NDTMP=MPI_BLOCK, NITMP=MPI_BLOCK, NLTMP=MPI_BLOCK
++      INTEGER :: NZTMP, NDTMP, NITMP, NLTMP
+ ! workspace for integer, complex, and real
+-      COMPLEX(q),SAVE :: ZTMP_m(NZTMP)
+-      REAL(q),SAVE    :: DTMP_m(NDTMP)
+-      INTEGER,SAVE    :: ITMP_m(NITMP)
+-      LOGICAL,SAVE    :: LTMP_m(NLTMP)
+-
+-#ifndef IFC
+-      EQUIVALENCE (DTMP_m,ZTMP_m)
+-      EQUIVALENCE (ITMP_m,ZTMP_m)
+-      EQUIVALENCE (LTMP_m,ZTMP_m)
+-#endif
+-#endif
++      COMPLEX(q), DIMENSION(:), ALLOCATABLE :: ZTMP_m
++
++#   if defined(IFC) || defined(MPI_WORK_ARRAY_EQUIVALENCE)
++      !EQUIVALENCE (DTMP_m,ZTMP_m)
++      !EQUIVALENCE (ITMP_m,ZTMP_m)
++      !EQUIVALENCE (LTMP_m,ZTMP_m)
++      REAL(q), DIMENSION(:), POINTER :: DTMP_m
++      INTEGER, DIMENSION(:), POINTER :: ITMP_m
++      LOGICAL, DIMENSION(:), POINTER :: LTMP_m
++#   else
++      REAL(q), DIMENSION(:), ALLOCATABLE :: DTMP_m
++      INTEGER, DIMENSION(:), ALLOCATABLE :: ITMP_m
++      LOGICAL, DIMENSION(:), ALLOCATABLE :: LTMP_m
++#   endif
++#endif
++
++      ! Private (internal) instance variables for the dynamic MPI_BLOCK
++      ! implementation:
++      LOGICAL, PRIVATE :: Is_MPI_BLOCK_inited = .FALSE.
++      INTEGER :: MPI_BLOCK_VALUE = MPI_BLOCK
++      PRIVATE :: M_init_MPI_BLOCK
+ 
+       CONTAINS
+ 
++      SUBROUTINE M_init_MPI_BLOCK( COMM )
++#if defined(HAVE_FORTRAN_2003) && defined(__INTEL_COMPILER)
++          ! Intel compilers provide getenv() in the IFPORT module
++          USE IFPORT
++#endif
++#if defined(IFC) || defined(MPI_WORK_ARRAY_EQUIVALENCE)
++          USE ISO_C_BINDING
++#endif
++          IMPLICIT NONE
++          
++          TYPE(communic) :: COMM
++          INTEGER :: ENVVAR_VALUE_LEN, IERROR
++          CHARACTER(LEN=255) :: ENVVAR_VALUE
++          
++          IF (.NOT. Is_MPI_BLOCK_inited) THEN
++              ! Determine the value of MPI_BLOCK, either from the environment
++              ! variable VASP_MPI_BLOCK or the compiled-in MPI_BLOCK macro.
++              ! Only the root rank consults the environment and decides; it
++              ! then distributes the chosen MPI_BLOCK to the other ranks:
++              IF (COMM%NODE_ME .EQ. 1) THEN
++#ifdef HAVE_FORTRAN_2003
++                  CALL GET_ENVIRONMENT_VARIABLE('VASP_MPI_BLOCK', ENVVAR_VALUE, ENVVAR_VALUE_LEN)
++#else
++                  CALL GETENV('VASP_MPI_BLOCK', ENVVAR_VALUE)
++                  ENVVAR_VALUE = TRIM(ENVVAR_VALUE)
++                  ENVVAR_VALUE_LEN = LEN(ENVVAR_VALUE)
++#endif
++                  MPI_BLOCK_VALUE = 0
++                  IF (ENVVAR_VALUE_LEN > 0) THEN
++                      READ(ENVVAR_VALUE, *, iostat=IERROR) MPI_BLOCK_VALUE
++                      IF (IERROR /= 0) THEN
++                          WRITE(0,'(A,X,A)') ' Invalid VASP_MPI_BLOCK in environment:', ENVVAR_VALUE
++                      ELSE
++                          WRITE(0,'(A,X,I0,X,A)') ' Using MPI_BLOCK size', MPI_BLOCK_VALUE, 'word(s) from environment'
++                       END IF
++                  END IF
++                  IF (MPI_BLOCK_VALUE <= 0) THEN
++                      MPI_BLOCK_VALUE = MPI_BLOCK
++                      WRITE(0,'(A,X,I0,X,A)') ' Using default MPI_BLOCK size', MPI_BLOCK_VALUE, 'word(s)'
++                  END IF
++              END IF
++              CALL MPI_bcast(MPI_BLOCK_VALUE, 1, MPI_integer, 0, COMM%MPI_COMM, IERROR)
++              
++              ! Set dimensioning instance variables associated with MPI_BLOCK
++              ! and allocate storage:
++#ifdef MPI_INPLACE
++              NDTMP = MPI_BLOCK_VALUE
++              IF (Allocated(DTMP_m)) Deallocate(DTMP_m)
++              Allocate(DTMP_m(NDTMP))
++              IF (COMM%NODE_ME .EQ. 1) THEN
++                  WRITE(0,*) 'MPI real work array allocated using MPI_BLOCK'
++                  WRITE(0,*) '        (MPI_INPLACE was set at compile time)'
++              END IF
++#else
++              ! The complex work array is allocated regardless -- it occupies
++              ! the largest amount of RAM and _can_ be reused for integer, real,
++              ! or logical work arrays as a result (using an EQUIVALENCE):
++              NZTMP = MPI_BLOCK_VALUE / 2
++              IF (Allocated(ZTMP_m)) Deallocate(ZTMP_m)
++              Allocate(ZTMP_m(NZTMP))
++
++#   if defined(IFC) || defined(MPI_WORK_ARRAY_EQUIVALENCE)
++              ! Pointer-based equivalence between work arrays:
++              CALL C_F_POINTER(C_LOC(ZTMP_m), DTMP_m, (/NDTMP/))
++              CALL C_F_POINTER(C_LOC(ZTMP_m), ITMP_m, (/NITMP/))
++              CALL C_F_POINTER(C_LOC(ZTMP_m), LTMP_m, (/NLTMP/))
++              NDTMP = MPI_BLOCK_VALUE
++              NITMP = MPI_BLOCK_VALUE
++              NLTMP = MPI_BLOCK_VALUE
++              IF (COMM%NODE_ME .EQ. 1) THEN
++                  WRITE(0,*) 'MPI complex work array allocated using MPI_BLOCK'
++                  WRITE(0,*) '        (with real/integer/logical equivalences)'
++              END IF
++#   else
++              ! The by-type work arrays are NOT an equivalence, so we must
++              ! allocate them separately:
++              NDTMP = MPI_BLOCK_VALUE
++              IF (Allocated(DTMP_m)) Deallocate(DTMP_m)
++              Allocate(DTMP_m(NDTMP))
++              
++              NITMP = MPI_BLOCK_VALUE
++              IF (Allocated(ITMP_m)) Deallocate(ITMP_m)
++              Allocate(ITMP_m(NITMP))
++              
++              NLTMP = MPI_BLOCK_VALUE
++              IF (Allocated(LTMP_m)) Deallocate(LTMP_m)
++              Allocate(LTMP_m(NLTMP))
++              IF (COMM%NODE_ME .EQ. 1) THEN
++                  WRITE(0,*) 'MPI work arrays allocated using MPI_BLOCK'
++              END IF
++#   endif
++#endif
++              Is_MPI_BLOCK_inited = .TRUE.
++          END IF
++      END SUBROUTINE M_init_MPI_BLOCK
++
+ !
+ ! Common error handling for all MPI calls. The macro wraps the subroutine with
+ ! the same name, to make it work with the preprocessor, we choose a different
+@@ -233,6 +339,9 @@
+       CHECK_MPI_ERROR(ierror,'M_init','MPI_comm_size')
+ 
+       COMM%IONODE = 1
++      
++! Get the MPI_BLOCK value setup and allocate associated workspace storage:
++      CALL M_init_MPI_BLOCK(COMM)
+ 
+ #ifdef qd_emulate
+       ! define a MPI_sum operation for qd_type 
+@@ -965,6 +1074,18 @@
+       CALL MPI_op_free( M_sum_qd_op, ierror )
+       IF ( ierror /= MPI_success ) &
+          CALL M_stop_ierr('M_exit: MPI_op_free returns: ',ierror)
++        
++      ! Drop any workspace allocatables associated with MPI_BLOCK:
++#ifdef MPI_INPLACE
++      IF (Allocated(DTMP_m)) Deallocate(DTMP_m)
++#else
++      IF (Allocated(ZTMP_m)) Deallocate(ZTMP_m)
++#   if ! defined(IFC) && ! defined(MPI_WORK_ARRAY_EQUIVALENCE)
++      IF (Allocated(DTMP_m)) Deallocate(DTMP_m)
++      IF (Allocated(ITMP_m)) Deallocate(ITMP_m)
++      IF (Allocated(LTMP_m)) Deallocate(LTMP_m)
++#   endif
++#endif
+ 
+       CALL MPI_finalize( ierror )
+       IF ( ierror /= MPI_success ) &
+@@ -3283,7 +3404,7 @@
+       INTEGER :: tag=201
+       INTEGER :: request((COMM%NCPU-1)*2)
+       INTEGER A_OF_STATUSES(MPI_STATUS_SIZE,(COMM%NCPU-1)*2)
+-      INTEGER, PARAMETER :: max_=MPI_BLOCK/2
++      INTEGER       :: max_
+       INTEGER       :: block, p, nstat
+       INTEGER       :: maxsnd_rcvcount
+ 
+@@ -3291,6 +3412,8 @@
+ 
+       maxsnd_rcvcount=MAX(MAXVAL(nsnd(1:COMM%NCPU)),MAXVAL(nrcv(1:COMM%NCPU)))
+ 
++      max_=MPI_BLOCK_VALUE/2
++
+     DO block = 0, maxsnd_rcvcount-1, max_
+       p        = 1 + block   ! pointer to the current block base address
+       nstat    = 0
+@@ -3592,7 +3715,7 @@
+       INTEGER       :: in
+       INTEGER       :: request((COMM%NCPU-1)*2)
+       INTEGER A_OF_STATUSES(MPI_STATUS_SIZE,(COMM%NCPU-1)*2)
+-      INTEGER, PARAMETER :: max_=MPI_BLOCK
++      INTEGER       :: max_
+       INTEGER       :: block, p, sndcount_
+       INTEGER       :: actual_proc_group, com_proc_group, &
+            proc_group, group_base, i_in_group, irequests
+@@ -3608,6 +3731,7 @@
+ 
+       sndcount = n/ COMM%NCPU
+       rcvcount = n/ COMM%NCPU
++      max_ = MPI_BLOCK_VALUE
+ 
+ !----------------------------------------------------------------------
+ #if defined(use_collective) || defined(_OPENACC)
+@@ -3844,7 +3968,7 @@
+       INTEGER       :: request((COMM%NCPU-1)*2)
+       INTEGER A_OF_STATUSES(MPI_STATUS_SIZE,(COMM%NCPU-1)*2)
+ ! test_
+-!     INTEGER, PARAMETER :: max_=MPI_BLOCK
++!     INTEGER, PARAMETER :: max_=MPI_BLOCK_VALUE
+       INTEGER       :: max_
+ ! test_
+       INTEGER       :: block, p, sndcount_
+@@ -3943,7 +4067,7 @@
+       INTEGER       :: in
+       INTEGER       :: request((COMM%NCPU-1)*2)
+       INTEGER A_OF_STATUSES(MPI_STATUS_SIZE,(COMM%NCPU-1)*2)
+-      INTEGER, PARAMETER :: max_=MPI_BLOCK
++      INTEGER       :: max_
+       INTEGER       :: block, p, sndcount_
+       INTEGER       :: actual_proc_group, com_proc_group, &
+            proc_group, group_base, i_in_group, irequests
+@@ -3953,6 +4077,7 @@
+ 
+       sndcount = n/ COMM%NCPU
+       rcvcount = n/ COMM%NCPU
++      max_ = MPI_BLOCK_VALUE
+ 
+ !----------------------------------------------------------------------
+ #ifdef use_collective
+@@ -4326,12 +4451,10 @@
+ ! too large blocks are slower on the Pentium architecture
+ ! probably due to caching
+ !
+-      INTEGER, PARAMETER :: max_=MPI_BLOCK
+-
+     ! quick return if possible
+       IF (COMM%NCPU == 1) RETURN
+       
+-      mmax=MIN(n/COMM%NCPU,max_)
++      mmax=MIN(n/COMM%NCPU, MPI_BLOCK_VALUE)
+       ALLOCATE(vec_inter(mmax*COMM%NCPU))
+ !----------------------------------------------------------------------
+ #endif
+@@ -4405,11 +4528,11 @@
+ ! too large blocks are slower on the Pentium architecture
+ ! probably due to caching
+ !
+-      INTEGER, PARAMETER :: max_=MPI_BLOCK
++      INTEGER :: max_
+ 
+     ! quick return if possible
+       IF (COMM%NCPU == 1) RETURN
+-      
++      max_ = MPI_BLOCK_VALUE
+       mmax=MIN(n/COMM%NCPU,max_)
+       ALLOCATE(vec_inter(mmax*COMM%NCPU))
+ 
+@@ -4487,7 +4610,7 @@
+ #ifdef use_collective_sum
+       CALL M_sumb_d(COMM, vec, 2*n)
+ #else
+-      IF ( 2*n>MPI_BLOCK) THEN
++      IF ( 2*n>MPI_BLOCK_VALUE) THEN
+          CALL M_sumf_d(COMM, vec, 2*n)
+       ELSE
+          CALL M_sumb_d(COMM, vec, 2*n)
+@@ -4567,7 +4690,7 @@
+ #ifdef use_collective_sum
+       CALL M_sumb_d(COMM, vec, n)
+ #else
+-      IF ( n>MPI_BLOCK) THEN
++      IF ( n>MPI_BLOCK_VALUE) THEN
+          CALL M_sumf_d(COMM, vec, n)
+       ELSE
+          CALL M_sumb_d(COMM, vec, n)
+@@ -4593,7 +4716,7 @@
+ #ifdef use_collective_sum
+       CALL M_sumb_s(COMM, vec, n)
+ #else
+-      IF ( n>MPI_BLOCK) THEN
++      IF ( n>MPI_BLOCK_VALUE) THEN
+          CALL M_sumf_s(COMM, vec, n)
+       ELSE
+          CALL M_sumb_s(COMM, vec, n)
+@@ -4618,8 +4741,8 @@
+ 
+       IF (COMM%NCPU == 1 ) RETURN
+ 
+-      DO i=1,n,MPI_BLOCK
+-         thisdata=min(n-i+1,MPI_BLOCK)
++      DO i=1,n,MPI_BLOCK_VALUE
++         thisdata=min(n-i+1,MPI_BLOCK_VALUE)
+ 
+          CALL MPI_reduce( vec(i), DTMP_m(1), thisdata, &
+                              MPI_double_precision, MPI_sum, &
