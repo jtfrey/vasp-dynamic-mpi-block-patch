@@ -76,7 +76,7 @@ diff -Naur A/mpi.F B/mpi.F
 +#else
 +                  CALL GETENV('VASP_MPI_BLOCK', ENVVAR_VALUE)
 +                  ENVVAR_VALUE = TRIM(ENVVAR_VALUE)
-+                  ENVVAR_VALUE_LEN = LEN(ENVVAR_VALUE)
++                  ENVVAR_VALUE_LEN = LEN_TRIM(ENVVAR_VALUE)
 +#endif
 +                  MPI_BLOCK_VALUE = 0
 +                  IF (ENVVAR_VALUE_LEN > 0) THEN
