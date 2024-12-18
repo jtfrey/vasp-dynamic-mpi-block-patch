@@ -1,6 +1,1580 @@
---- A/mpi.F	2024-11-15 15:17:03.244570322 -0500
-+++ B/mpi.F	2024-11-15 15:28:13.469770856 -0500
-@@ -129,28 +129,134 @@
+diff -Naur A/envvar.F B/envvar.F
+--- A/envvar.F	1969-12-31 19:00:00.000000000 -0500
++++ B/envvar.F	2024-12-11 16:02:19.000000000 -0500
+@@ -0,0 +1,644 @@
++!
++! @module envvar
++!
++! A module that groups together routines that assist with reading values
++! from the environment at runtime.  At the most basic, we want to be able
++! to fetch the string value of an environment variable, possibly with a
++! default value should the variable not be set.  It would be helpful if
++! the value could also be converted to atomic types -- integer, real, and
++! logical.
++!
++! All of the "getters" share a common signature, and so they are bundled
++! under the envvar_get() interface -- with the second argument's (the output
++! variable's) deciding which function is used.  E.g.
++!
++!     Real(8) :: rng_seed
++!     If (envvar_get('VASP_RNG_SEED', rng_seed)) Then
++!         Write(*,*) 'RNG seed = ', rng_seed
++!     Else
++!         Write(*,*) 'RNG seed not present in environment'
++!           :
++!     End If
++!
++Module envvar
++    Implicit none
++    
++    !
++    ! @constant ENVVAR_MAX_VALUE_LEN
++    !
++    ! Static dimension for the value of environment variables.
++    !
++    Integer, Parameter :: ENVVAR_MAX_VALUE_LEN = 1024
++    
++    !
++    ! @enum ENVVAR_ERR
++    !
++    ! Enumeration of the error codes that can be returned by
++    ! the "getter" functions.
++    !
++    Integer, Parameter :: ENVVAR_ERR_NONE = 0
++    Integer, Parameter :: ENVVAR_ERR_NO_VALUE = 1
++    Integer, Parameter :: ENVVAR_ERR_USED_DEFAULT = 2
++    Integer, Parameter :: ENVVAR_ERR_CONVERT_FAIL = 3
++    
++    !
++    ! @interface envvar_get
++    !
++    ! Since the six different "getter" functions share a
++    ! common argument signature -- except for the type of
++    ! the output value and default value -- the functions
++    ! are exposed with a singular name that allows the
++    ! compiler to inspect the arguments and choose the
++    ! correct underlying function at compile time.
++    !
++    ! All functions follow the signature
++    !
++    !   Integer Funtion envvar_get(envvar_name, out_int,
++    !                       is_required, default_value,
++    !                       envstat)
++    !
++    ! where only the first two arguments are mandatory.
++    !
++    ! Thus, envvar_get() can be used in lieu of the
++    ! typed function names.
++    !
++    Interface envvar_get
++        Module procedure envvar_get_string, &
++                         envvar_get_integer1, envvar_get_integer2, &
++                         envvar_get_integer4, envvar_get_integer8, &
++                         envvar_get_real4, envvar_get_real8, &
++                         envvar_get_logical
++    End Interface
++    
++    Contains
++    
++        !
++        ! @subroutine envvar_err_string
++        !
++        ! Returns a string describing the given error code.
++        !
++        Subroutine envvar_err_string(envstat, out_str)
++            Implicit none
++            Integer, Intent(In) :: envstat
++            Character(len=*), Intent(Out) :: out_str
++        
++            If (envstat == ENVVAR_ERR_NONE) Then
++                out_str = 'No error.'
++            Else If (envstat == ENVVAR_ERR_NO_VALUE) Then
++                out_str = 'No value set.'
++            Else If (envstat == ENVVAR_ERR_USED_DEFAULT) Then
++                out_str = 'Default value used.'
++            Else If (envstat == ENVVAR_ERR_CONVERT_FAIL) Then
++                out_str = 'Value conversion failed.'
++            Else
++                out_str = 'Unknown error code.'
++            End If
++        End Subroutine
++
++        !
++        ! @function envvar_is_set
++        !
++        ! Returns .True. if the environment variable with the given
++        ! envvar_name exists and has a non-empty value.
++        !
++        Function envvar_is_set(envvar_name)
++#ifdef __INTEL_COMPILER
++            ! Intel compilers provide getenv() in the IFPORT module
++            Use ifport
++#endif
++            Implicit none
++            Logical :: envvar_is_set
++            Character(len=*), Intent(In) :: envvar_name
++        
++            Character(len=ENVVAR_MAX_VALUE_LEN) :: envvar_value
++            Integer                             :: envvar_value_len, ierr
++
++#ifdef HAVE_FORTRAN_2003
++            Call Get_environment_variable(envvar_name, envvar_value, &
++                            envvar_value_len, ierr)
++            envvar_is_set = ((ierr /= 1 .and. ierr /= 2) .or. envvar_value_len == 0)
++#else
++            Call Getenv(envvar_name, envvar_value)
++            envvar_is_set = (len_trim(envvar_value) /= 0)
++#endif
++        End Function envvar_is_set
++        
++        !
++        ! @function envvar_test_logical
++        !
++        ! Attempt to get a logical value from the environment variable with the
++        ! given envvar_name.  If the optional argument default_value is not
++        ! present, a default_value of .False. is passed to envvar_get_logical()
++        ! so that the out_bool is set regardless of the presence of a value in
++        ! the environment.  This makes conditionals like
++        !
++        !         If (envvar_test_logical('VASP_USE_XYZ')) Then
++        !               :
++        !
++        ! behave properly w.r.t. the variable's being set in the environment
++        ! or not.
++        !
++        Function envvar_test_logical(envvar_name, default_value)
++            Implicit none
++            Logical                         :: envvar_test_logical
++            Character(len=*), Intent(In)    :: envvar_name
++            Logical, Optional, Intent(In)   :: default_value
++        
++            Logical                         :: env_value, was_set
++        
++            env_value = .False.
++            If (Present(default_value)) Then
++                was_set = envvar_get_logical(envvar_name=envvar_name, out_bool=env_value, &
++                                          default_value=default_value)
++            Else
++                was_set = envvar_get_logical(envvar_name=envvar_name, out_bool=env_value, &
++                                          default_value=.False.)
++            End If
++            envvar_test_logical = env_value
++        End Function envvar_test_logical
++
++        !
++        ! @function get_env_string
++        !
++        ! Attempt to set out_str to the value of the environment variable with
++        ! the given envvar_name.  If the optional argument is_required is true
++        ! and the variable is not set or has no string value, the program will
++        ! terminate with an error message.
++        !
++        ! Otherwise, if the environment variable is not set or has no string
++        ! value, the function will return .False.  Note that if the optional
++        ! argument default_value is present, the out_str will be set to it.
++        !
++        ! Finally, if a value is present then out_str is set to that value and
++        ! .True. is returned.
++        !
++        ! If the optional argument envstat is present, on return it is set
++        ! to a value from the ENVVAR_ERR enumeration indicating what errors
++        ! or conditions occurred.
++        !
++        Function envvar_get_string(envvar_name, out_str, is_required, &
++                                   default_value, envstat)
++#ifdef __INTEL_COMPILER
++            ! Intel compilers provide getenv() in the IFPORT module
++            Use ifport
++#endif
++            Implicit none
++            Logical :: envvar_get_string
++            Character(len=*), Intent(In) :: envvar_name
++            Character(len=*), Intent(Out) :: out_str
++            Logical, Optional, Intent(In) :: is_required
++            Character(len=*), Optional, Intent(In) :: default_value
++            Integer, Optional, Intent(Out) :: envstat
++
++            character(len=ENVVAR_MAX_VALUE_LEN) :: envvar_value
++            integer                             :: envvar_value_len, ierror
++
++#ifdef HAVE_FORTRAN_2003
++            Call Get_environment_variable(envvar_name, envvar_value, envvar_value_len)
++#else
++            Call Getenv(envvar_name, envvar_value)
++            envvar_value = trim(envvar_value)
++            envvar_value_len = len_trim(envvar_value)
++#endif
++            If (envvar_value_len > 0) Then
++                envvar_get_string = .True.
++                out_str = envvar_value(1:envvar_value_len)
++                If (Present(envstat)) envstat = ENVVAR_ERR_NONE
++            Else If (Present(is_required)) Then
++                If (is_required) Then
++                    Write(*, '(A,A,A)') 'Error:  value for envvar `', envvar_name, '` is required.'
++                    Stop
++                End If
++            Else
++                envvar_get_string = .False.
++                If (Present(default_value)) Then
++                    out_str = default_value
++                    If (Present(envstat)) envstat = ENVVAR_ERR_USED_DEFAULT
++                Else
++                    If (Present(envstat)) envstat = ENVVAR_ERR_NO_VALUE
++                End If
++            End If
++        End Function envvar_get_string
++
++        !
++        ! @function envvar_get_integer*
++        !
++        ! Attempt to set out_int to the integer value of the environment variable
++        ! with the given envvar_name.  If the optional argument is_required is
++        ! true and the variable is not set or has no string value, the program
++        ! will terminate with an error message.
++        !
++        ! Otherwise, if the environment variable is not set or has no string
++        ! value, the function will return .False.  Note that if the optional
++        ! argument default_value is present, the out_int will be set to it.
++        !
++        ! Finally, if a value is present then the function attempts to parse an
++        ! integer from that string.  If successful, out_int is set and .True.
++        ! is returned.  Otherwise, if is_required is present and .True. then
++        ! the program will terminate with an error message.  Finally, .False.
++        ! is returned.
++        !
++        ! If the optional argument envstat is present, on return it is set
++        ! to a value from the ENVVAR_ERR enumeration indicating what errors
++        ! or conditions occurred.
++        !
++        Function envvar_get_integer1(envvar_name, out_int, is_required, &
++                                     default_value, envstat)
++            Use fstring, only: fstring_parse
++            Implicit none
++            Logical :: envvar_get_integer1
++            Character(len=*), Intent(In) :: envvar_name
++            Integer(1), Intent(Out) :: out_int
++            Logical, Optional, Intent(In) :: is_required
++            Integer(1), Optional, Intent(In) :: default_value
++            Integer, Optional, Intent(Out) :: envstat
++
++            Character(len=ENVVAR_MAX_VALUE_LEN) :: envvar_value
++            Logical                             :: has_value
++
++            If (Present(is_required)) Then
++                has_value = envvar_get_string(envvar_name, envvar_value, is_required)
++            Else
++                has_value = envvar_get_string(envvar_name, envvar_value, .False.)
++            End If
++            envvar_get_integer1 = has_value
++            If (has_value) Then
++                If (fstring_parse(envvar_value, out_int)) Then
++                    If (Present(envstat)) envstat = ENVVAR_ERR_NONE
++                Else
++                    envvar_get_integer1 = .False.
++                    If (Present(is_required) .and. is_required) Then
++                        Write(*, '(A,A,A)') 'Error:  value for envvar `', envvar_name, '` is not an integer.'
++                        Stop
++                    End If
++                    If (Present(envstat)) envstat = ENVVAR_ERR_CONVERT_FAIL
++                End If
++            Else If (Present(default_value)) Then
++                out_int = default_value
++                If (Present(envstat)) envstat = ENVVAR_ERR_USED_DEFAULT
++            Else
++                If (Present(envstat)) envstat = ENVVAR_ERR_NO_VALUE
++            End If
++        End Function envvar_get_integer1
++        !
++        Function envvar_get_integer2(envvar_name, out_int, is_required, &
++                                     default_value, envstat)
++            Use fstring, only: fstring_parse
++            Implicit none
++            Logical :: envvar_get_integer2
++            Character(len=*), Intent(In) :: envvar_name
++            Integer(2), Intent(Out) :: out_int
++            Logical, Optional, Intent(In) :: is_required
++            Integer(2), Optional, Intent(In) :: default_value
++            Integer, Optional, Intent(Out) :: envstat
++
++            Character(len=ENVVAR_MAX_VALUE_LEN) :: envvar_value
++            Logical                             :: has_value
++
++            If (Present(is_required)) Then
++                has_value = envvar_get_string(envvar_name, envvar_value, is_required)
++            Else
++                has_value = envvar_get_string(envvar_name, envvar_value, .False.)
++            End If
++            envvar_get_integer2 = has_value
++            If (has_value) Then
++                If (fstring_parse(envvar_value, out_int)) Then
++                    If (Present(envstat)) envstat = ENVVAR_ERR_NONE
++                Else
++                    envvar_get_integer2 = .False.
++                    If (Present(is_required) .and. is_required) Then
++                        Write(*, '(A,A,A)') 'Error:  value for envvar `', envvar_name, '` is not an integer.'
++                        Stop
++                    End If
++                    If (Present(envstat)) envstat = ENVVAR_ERR_CONVERT_FAIL
++                End If
++            Else If (Present(default_value)) Then
++                out_int = default_value
++                If (Present(envstat)) envstat = ENVVAR_ERR_USED_DEFAULT
++            Else
++                If (Present(envstat)) envstat = ENVVAR_ERR_NO_VALUE
++            End If
++        End Function envvar_get_integer2
++        !
++        Function envvar_get_integer4(envvar_name, out_int, is_required, &
++                                     default_value, envstat)
++            Use fstring, only: fstring_parse
++            Implicit none
++            Logical :: envvar_get_integer4
++            Character(len=*), Intent(In) :: envvar_name
++            Integer(4), Intent(Out) :: out_int
++            Logical, Optional, Intent(In) :: is_required
++            Integer(4), Optional, Intent(In) :: default_value
++            Integer, Optional, Intent(Out) :: envstat
++
++            Character(len=ENVVAR_MAX_VALUE_LEN) :: envvar_value
++            Logical                             :: has_value
++
++            If (Present(is_required)) Then
++                has_value = envvar_get_string(envvar_name, envvar_value, is_required)
++            Else
++                has_value = envvar_get_string(envvar_name, envvar_value, .False.)
++            End If
++            envvar_get_integer4 = has_value
++            If (has_value) Then
++                If (fstring_parse(envvar_value, out_int)) Then
++                    If (Present(envstat)) envstat = ENVVAR_ERR_NONE
++                Else
++                    envvar_get_integer4 = .False.
++                    If (Present(is_required) .and. is_required) Then
++                        Write(*, '(A,A,A)') 'Error:  value for envvar `', envvar_name, '` is not an integer.'
++                        Stop
++                    End If
++                    If (Present(envstat)) envstat = ENVVAR_ERR_CONVERT_FAIL
++                End If
++            Else If (Present(default_value)) Then
++                out_int = default_value
++                If (Present(envstat)) envstat = ENVVAR_ERR_USED_DEFAULT
++            Else
++                If (Present(envstat)) envstat = ENVVAR_ERR_NO_VALUE
++            End If
++        End Function envvar_get_integer4
++        !
++        Function envvar_get_integer8(envvar_name, out_int, is_required, &
++                                     default_value, envstat)
++            Use fstring, only: fstring_parse
++            Implicit none
++            Logical :: envvar_get_integer8
++            Character(len=*), Intent(In) :: envvar_name
++            Integer(8), Intent(Out) :: out_int
++            Logical, Optional, Intent(In) :: is_required
++            Integer(8), Optional, Intent(In) :: default_value
++            Integer, Optional, Intent(Out) :: envstat
++
++            Character(len=ENVVAR_MAX_VALUE_LEN) :: envvar_value
++            Logical                             :: has_value
++
++            If (Present(is_required)) Then
++                has_value = envvar_get_string(envvar_name, envvar_value, is_required)
++            Else
++                has_value = envvar_get_string(envvar_name, envvar_value, .False.)
++            End If
++            envvar_get_integer8 = has_value
++            If (has_value) Then
++                If (fstring_parse(envvar_value, out_int)) Then
++                    If (Present(envstat)) envstat = ENVVAR_ERR_NONE
++                Else
++                    envvar_get_integer8 = .False.
++                    If (Present(is_required) .and. is_required) Then
++                        Write(*, '(A,A,A)') 'Error:  value for envvar `', envvar_name, '` is not an integer.'
++                        Stop
++                    End If
++                    If (Present(envstat)) envstat = ENVVAR_ERR_CONVERT_FAIL
++                End If
++            Else If (Present(default_value)) Then
++                out_int = default_value
++                If (Present(envstat)) envstat = ENVVAR_ERR_USED_DEFAULT
++            Else
++                If (Present(envstat)) envstat = ENVVAR_ERR_NO_VALUE
++            End If
++        End Function envvar_get_integer8
++
++        !
++        ! @function envvar_get_logical
++        !
++        ! Attempt to set out_bool to the boolean value of the environment
++        ! variable with the given envvar_name.  If the optional argument
++        ! is_required is true and the variable is not set or has no string
++        ! value, the program will terminate with an error message.
++        !
++        ! Otherwise, if the environment variable is not set or has no string
++        ! value, the function will return .False.  Note that if the optional
++        ! argument default_value is present, the out_real will be set to it.
++        !
++        ! Finally, if a value is present then the function attempts to parse
++        ! the value as an integer.  If successful, then out_bool is set to
++        ! .True. if the value is non-zero, .False. for zero.  If the value
++        ! was not parseable, then it is matched against a set of "true" string
++        ! constants
++        !
++        !       yes, y, true, t, on
++        !
++        ! with out_bool set to .True. if a match is found, .False. otherwise.
++        !
++        ! If the optional argument envstat is present, on return it is set
++        ! to a value from the ENVVAR_ERR enumeration indicating what errors
++        ! or conditions occurred.
++        !
++        Function envvar_get_logical(envvar_name, out_bool, is_required, &
++                                    default_value, envstat)
++            Use fstring, only : fstring_parse
++            Implicit none
++            Logical :: envvar_get_logical
++            Character(len=*), Intent(In) :: envvar_name
++            Logical, Intent(Out) :: out_bool
++            Logical, Optional, Intent(In) :: is_required
++            Logical, Optional, Intent(In) :: default_value
++            Integer, Optional, Intent(Out) :: envstat
++
++            Character(len=ENVVAR_MAX_VALUE_LEN) :: envvar_value
++            Logical                             :: has_value
++            Integer                             :: ierr, intval
++
++            If (Present(is_required)) Then
++                has_value = envvar_get_string(envvar_name, envvar_value, is_required)
++            Else
++                has_value = envvar_get_string(envvar_name, envvar_value, .False.)
++            End If
++            envvar_get_logical = has_value
++            If (has_value) Then
++                Read(envvar_value, *, iostat=ierr) intval
++                If (ierr == 0) Then
++                    out_bool = (intval /= 0)
++                    If (Present(envstat)) envstat = ENVVAR_ERR_NONE
++                Else
++                    If ( fstring_parse(envvar_value, out_bool) ) Then
++                        If (Present(envstat)) envstat = ENVVAR_ERR_NONE
++                    Else
++                        envvar_get_logical = .False.
++                        If (Present(envstat)) envstat = ENVVAR_ERR_CONVERT_FAIL
++                    End If
++                End If
++            Else If (Present(default_value)) Then
++                out_bool = default_value
++                If (Present(envstat)) envstat = ENVVAR_ERR_USED_DEFAULT
++            Else
++                out_bool = .False.
++                If (Present(envstat)) envstat = ENVVAR_ERR_NO_VALUE
++            End If
++        End Function envvar_get_logical
++
++        !
++        ! @function envvar_get_real*
++        !
++        ! Attempt to set out_real to the real value of the environment variable
++        ! with the given envvar_name.  If the optional argument is_required is
++        ! true and the variable is not set or has no string value, the program
++        ! will terminate with an error message.
++        !
++        ! Otherwise, if the environment variable is not set or has no string
++        ! value, the function will return .False.  Note that if the optional
++        ! argument default_value is present, the out_real will be set to it.
++        !
++        ! Finally, if a value is present then the function attempts to parse an
++        ! real from that string.  If successful, out_real is set and .True.
++        ! is returned.  Otherwise, if is_required is present and .True. then
++        ! the program will terminate with an error message.  Finally, .False.
++        ! is returned.
++        !
++        ! If the optional argument envstat is present, on return it is set
++        ! to a value from the ENVVAR_ERR enumeration indicating what errors
++        ! or conditions occurred.
++        !
++        Function envvar_get_real4(envvar_name, out_real, is_required, &
++                                  default_value, envstat)
++            Use fstring, only: fstring_parse
++            Implicit none
++            Logical :: envvar_get_real4
++            Character(len=*), Intent(In) :: envvar_name
++            Real(4), Intent(Out) :: out_real
++            Logical, Optional, Intent(In) :: is_required
++            Real(4), Optional, Intent(In) :: default_value
++            Integer, Optional, Intent(Out) :: envstat
++
++            Character(len=ENVVAR_MAX_VALUE_LEN) :: envvar_value
++            Logical                             :: has_value
++            Integer                             :: ierr
++
++            If (Present(is_required)) Then
++                has_value = envvar_get_string(envvar_name, envvar_value, is_required)
++            Else
++                has_value = envvar_get_string(envvar_name, envvar_value, .False.)
++            End If
++            envvar_get_real4 = has_value
++            If (has_value) Then
++                If (fstring_parse(envvar_value, out_real)) Then
++                    If (Present(envstat)) envstat = ENVVAR_ERR_NONE
++                Else
++                    envvar_get_real4 = .False.
++                    If (Present(is_required) .and. is_required) Then
++                        Write(*, '(A,A,A)') 'Error:  value for envvar `', envvar_name, '` is not a real.'
++                        Stop
++                    End If
++                    If (Present(envstat)) envstat = ENVVAR_ERR_CONVERT_FAIL
++                End If
++            Else If (Present(default_value)) Then
++                out_real = default_value
++                If (Present(envstat)) envstat = ENVVAR_ERR_USED_DEFAULT
++            Else
++                If (Present(envstat)) envstat = ENVVAR_ERR_NO_VALUE
++            End If
++        End Function envvar_get_real4
++        !
++        Function envvar_get_real8(envvar_name, out_real, is_required, &
++                                  default_value, envstat)
++            Use fstring, only: fstring_parse
++            Implicit none
++            Logical :: envvar_get_real8
++            Character(len=*), Intent(In) :: envvar_name
++            Real(8), Intent(Out) :: out_real
++            Logical, Optional, Intent(In) :: is_required
++            Real(8), Optional, Intent(In) :: default_value
++            Integer, Optional, Intent(Out) :: envstat
++
++            Character(len=ENVVAR_MAX_VALUE_LEN) :: envvar_value
++            Logical                             :: has_value
++            Integer                             :: ierr
++
++            If (Present(is_required)) Then
++                has_value = envvar_get_string(envvar_name, envvar_value, is_required)
++            Else
++                has_value = envvar_get_string(envvar_name, envvar_value, .False.)
++            End If
++            envvar_get_real8 = has_value
++            If (has_value) Then
++                If (fstring_parse(envvar_value, out_real)) Then
++                    If (Present(envstat)) envstat = ENVVAR_ERR_NONE
++                Else
++                    envvar_get_real8 = .False.
++                    If (Present(is_required) .and. is_required) Then
++                        Write(*, '(A,A,A)') 'Error:  value for envvar `', envvar_name, '` is not a real.'
++                        Stop
++                    End If
++                    If (Present(envstat)) envstat = ENVVAR_ERR_CONVERT_FAIL
++                End If
++            Else If (Present(default_value)) Then
++                out_real = default_value
++                If (Present(envstat)) envstat = ENVVAR_ERR_USED_DEFAULT
++            Else
++                If (Present(envstat)) envstat = ENVVAR_ERR_NO_VALUE
++            End If
++        End Function envvar_get_real8
++
++End Module envvar
++
++#ifdef WANT_ENVVAR_TEST_PROGRAM
++
++Program envvar_test
++    Use envvar
++    Implicit none
++
++    Integer :: envstat
++    Integer(kind=4) :: i1
++    Integer(kind=8) :: i2
++    Real(4) :: r1
++    Real(8) :: r2
++    Logical :: l, was_set
++    Character(len=64) :: errstr
++    
++    write(*,*) 'PATH envvar is set = ', envvar_is_set('PATH')
++    write(*,*)
++    
++    was_set = envvar_get('BORKI', i1, envstat=envstat)
++    write(*,*) was_set, envstat, i1
++    If (envstat /= ENVVAR_ERR_NONE) Then
++        Call envvar_err_string(envstat, errstr)
++        Write(*,*) 'Error:  ', errstr
++    End If
++    write(*,*)
++    
++    was_set = envvar_get('BORKI', i2, envstat=envstat)
++    write(*,*) was_set, envstat, i2
++    If (envstat /= ENVVAR_ERR_NONE) Then
++        Call envvar_err_string(envstat, errstr)
++        Write(*,*) 'Error:  ', errstr
++    End If
++    write(*,*)
++    
++    was_set = envvar_get('BORKR', r1, envstat=envstat)
++    write(*,*) was_set, envstat, r1
++    If (envstat /= ENVVAR_ERR_NONE) Then
++        Call envvar_err_string(envstat, errstr)
++        Write(*,*) 'Error:  ', errstr
++    End If
++    write(*,*)
++    
++    was_set = envvar_get('BORKR', r2, envstat=envstat)
++    write(*,*) was_set, envstat, r2
++    If (envstat /= ENVVAR_ERR_NONE) Then
++        Call envvar_err_string(envstat, errstr)
++        Write(*,*) 'Error:  ', errstr
++    End If
++    write(*,*)
++    
++    l = .False.
++    was_set = envvar_get('BORKL', l, default_value=.False., envstat=envstat)
++    write(*,*) was_set, envstat, l
++    If (envstat /= ENVVAR_ERR_NONE) Then
++        Call envvar_err_string(envstat, errstr)
++        Write(*,*) 'Error:  ', errstr
++    End If
++    write(*,*)
++    
++    was_set = envvar_get('BORKIIIII', i1, envstat=envstat)
++    write(*,*) was_set, envstat, i1
++    If (envstat /= ENVVAR_ERR_NONE) Then
++        Call envvar_err_string(envstat, errstr)
++        Write(*,*) 'Error:  ', errstr
++    End If
++    write(*,*)
++    
++    If (envvar_test_logical('IS_SET')) write(*,*) 'IS_SET was set'
++
++End Program envvar_test
++
++#endif
+\ No newline at end of file
+diff -Naur A/fstring.F B/fstring.F
+--- A/fstring.F	1969-12-31 19:00:00.000000000 -0500
++++ B/fstring.F	2024-12-11 15:49:27.000000000 -0500
+@@ -0,0 +1,920 @@
++!
++! @module fstring
++!
++! Functions and subroutines that operate on character strings.
++!
++Module fstring
++    Implicit none
++    
++    ! All components default to private, we'll explicitly-expose
++    ! what's meant to be public:
++    Private
++    
++    !
++    ! @constant FSTRING_TRUE_STRINGS
++    !
++    ! A list of strings that are interpreted as meaning .true.
++    !
++    Character(len=4), Dimension(5) :: FSTRING_TRUE_STRINGS = &
++                                        (/'true', 't   ', 'on  ', 'yes ', 'y   '/)
++                                        
++    !
++    ! @constant FSTRING_FALSE_STRINGS
++    !
++    ! A list of strings that are interpreted as meaning .false.
++    !
++    Character(len=5), Dimension(5) :: FSTRING_FALSE_STRINGS = &
++                                        (/'false', 'f    ', 'off  ', 'no   ', 'n    '/)
++    
++    !
++    ! @interface fstring_parse
++    !
++    ! Abstracted type-based interface to parsing functions under
++    ! the name fstring_parse().
++    !
++    Interface fstring_parse
++        Module procedure fstring_parse_integer1, fstring_parse_integer2, &
++                         fstring_parse_integer4, fstring_parse_integer8, &
++                         fstring_parse_real4, fstring_parse_real8, &
++                         fstring_parse_logical
++    End Interface fstring_parse
++    
++    ! Expose all of the following functions and subroutines to external
++    ! callers:
++    Public :: fstring_parse, fstring_casecmp, fstring_in_list, fstring_tolower, &
++              fstring_toupper, fstring_totitle, fstring_char_digittoint, &
++              fstring_char_isalnum, fstring_char_isalpha, fstring_char_isascii, &
++              fstring_char_isdigit, fstring_char_islower, fstring_char_isupper, &
++              fstring_char_isxdigit
++    
++#ifdef HAVE_FORTRAN_2003
++    !
++    ! @interface ISO C character-class tests
++    !
++    ! Fortran 2003 allows us to bind directly to C functions, so the
++    ! native character-class tests can be used directly from Fortran.
++    ! The C functions expect an int argument containing a character
++    ! code (e.g. from iachar()) and return a non-zero int if the
++    ! character is in the given class, zero otherwise.
++    !
++    ! Lacking a Fortran 2003 compiler, there are native Fortran
++    ! functions defined below with the same name and signature, so
++    ! higher-level functions in this module can be written to make
++    ! user of c_*() functions, regardless.
++    !
++    Interface
++        Integer(C_INT) Function c_isalnum(c) BIND(C, NAME="isalnum")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_isalnum
++        Integer(C_INT) Function c_isalpha(c) BIND(C, NAME="isalpha")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_isalpha
++        Integer(C_INT) Function c_isascii(c) BIND(C, NAME="isascii")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_isascii
++        Integer(C_INT) Function c_isblank(c) BIND(C, NAME="isblank")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_isblank
++        Integer(C_INT) Function c_iscntrl(c) BIND(C, NAME="iscntrl")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_iscntrl
++        Integer(C_INT) Function c_isdigit(c) BIND(C, NAME="isdigit")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_isdigit
++        Integer(C_INT) Function c_isgraph(c) BIND(C, NAME="isgraph")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_isgraph
++        Integer(C_INT) Function c_islower(c) BIND(C, NAME="islower")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_islower
++        Integer(C_INT) Function c_isprint(c) BIND(C, NAME="isprint")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_isprint
++        Integer(C_INT) Function c_ispunct(c) BIND(C, NAME="ispunct")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_ispunct
++        Integer(C_INT) Function c_isspace(c) BIND(C, NAME="isspace")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_isspace
++        Integer(C_INT) Function c_isupper(c) BIND(C, NAME="isupper")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_isupper
++        Integer(C_INT) Function c_isxdigit(c) BIND(C, NAME="isxdigit")
++            Use, Intrinsic :: ISO_C_BINDING, ONLY : C_INT
++            Integer(C_INT), VALUE :: c
++        End Function c_isxdigit
++    End Interface
++#endif
++
++Contains
++
++#ifndef HAVE_FORTRAN_2003
++    !
++    ! @function c_is*
++    !
++    ! Character-class test functions.  Each function accepts a single
++    ! integer argument representing a character code (e.g. via iachar())
++    ! and returns a non-zero integer if the character is in the class,
++    ! or zero otherwise.
++    !
++    ! These are Fortran-native implementations of the C functions we
++    ! bind to directly in Fortran 2003.  These Fortran versions assume
++    ! an ASCII character set.
++    !
++    Function c_isalnum(c)
++        Implicit none
++        Integer :: c_isalnum, c
++        If ((c_isalpha(c) /= 0) .or. (c_isdigit(c) /= 0)) Then
++            c_isalnum = 1
++        Else
++            c_isalnum = 0
++        End If
++    End Function c_isalnum
++    !
++    Function c_isalpha(c)
++        Implicit none
++        Integer :: c_isalpha, c
++        If ((c >= iachar('a') .and. c <= iachar('z')) .or. &
++                     (c >= iachar('A') .and. c <= iachar('Z'))) Then
++            c_isalpha = 1
++        Else
++            c_isalpha = 0
++        End If
++    End Function c_isalpha
++    !
++    Function c_isascii(c)
++        Implicit none
++        Integer :: c_isascii, c
++        If (c >= 0 .and. c <= 127) Then
++            c_isascii = 1
++        Else
++            c_isascii = 0
++        End If
++    End Function c_isascii
++    !
++    Function c_isblank(c)
++        Implicit none
++        Integer :: c_isblank, c
++        If (c == 9 .or. c == iachar(' ')) Then
++            c_isblank = 1
++        Else
++            c_isblank = 0
++        End If
++    End Function c_isblank
++    !
++    Function c_iscntrl(c)
++        Implicit none
++        Integer :: c_iscntrl, c
++        If ((c >= 0 .and. c <= 31) .or. (c == 127)) Then
++            c_iscntrl = 1
++        Else
++            c_iscntrl = 0
++        End If
++    End Function c_iscntrl
++    !
++    Function c_isdigit(c)
++        Implicit none
++        Integer :: c_isdigit, c
++        If (c >= iachar('0') .and. c <= iachar('9')) Then
++            c_isdigit = 1
++        Else
++            c_isdigit = 0
++        End If
++    End Function c_isdigit
++    !
++    Function c_isgraph(c)
++        Implicit none
++        Integer :: c_isgraph, c
++        If (c >= 33 .and. c <= 126) Then
++            c_isgraph = 1
++        Else
++            c_isgraph = 0
++        End If
++    End Function c_isgraph
++    !
++    Function c_islower(c)
++        Implicit none
++        Integer :: c_islower, c
++        If (c >= iachar('a') .and. c <= iachar('z')) Then
++            c_islower = 1
++        Else
++            c_islower = 0
++        End If
++    End Function c_islower
++    !
++    Function c_isprint(c)
++        Implicit none
++        Integer :: c_isprint, c
++        If (c >= 32 .and. c <= 126) Then
++            c_isprint = 1
++        Else
++            c_isprint = 0
++        End If
++    End Function c_isprint
++    !
++    Function c_ispunct(c)
++        Implicit none
++        Integer :: c_ispunct, c
++        If ((c >= 33 .and. c <= 47) .or. (c >= 58 .and. c <= 64) .or. &
++            (c >= 91 .and. c <= 96) .or. (c >= 123 .and. c <= 126)) Then
++            c_ispunct = 1
++        Else
++            c_ispunct = 0
++        End If
++    End Function c_ispunct
++    !
++    Function c_isspace(c)
++        Implicit none
++        Integer :: c_isspace, c
++        If ((c >= 9 .and. c <= 13) .or. c == 32) Then
++            c_isspace = 1
++        Else
++            c_isspace = 0
++        End If
++    End Function c_isspace
++    !
++    Function c_isupper(c)
++        Implicit none
++        Integer :: c_isupper, c
++        If (c >= iachar('A') .and. c <= iachar('Z')) Then
++            c_isupper = 1
++        Else
++            c_isupper = 0
++        End If
++    End Function c_isupper
++    !
++    Function c_isxdigit(c)
++        Implicit none
++        Integer :: c_isxdigit, c
++        If ((c >= iachar('0') .and. c <= iachar('9')) .or. &
++            (c >= iachar('A') .and. c <= iachar('F')) .or. &
++            (c >= iachar('a') .and. c <= iachar('f'))) Then
++            c_isxdigit = 1
++        Else
++            c_isxdigit = 0
++        End If
++    End Function c_isxdigit
++#endif
++
++    !
++    ! @function fstring_casecmp
++    !
++    ! Compare two Fortran strings ignoring alphabetic case
++    ! according to ASCII encoding standards.
++    !
++    ! Returns a negative integer if s1 sorts before s2;
++    ! a positive integer if s2 sorts before s1; or zero if
++    ! the s1 is equivalent to s2.
++    !
++    Function fstring_casecmp(s1, s2)
++        Implicit none
++        Integer :: fstring_casecmp
++        Character(len=*), Intent(in) :: s1, s2
++        Integer :: s_idx, s1_len, s2_len, s_min, c1, c2
++        
++        ! Starting character values are zero so a zero-length
++        ! string will compare the same below:
++        c1 = 0
++        c2 = 0
++        ! Get the trimmed length of each of the strings and
++        ! determine which is shorter:
++        s1_len = len_trim(s1)
++        s2_len = len_trim(s2)
++        s_min = min(s1_len, s2_len)
++        If (s_min > 0) Then
++            ! We actually have some characters to process; only
++            ! do the number of characters in the smaller string:
++            Do s_idx = 1, s_min
++                ! Get the ASCII code for the character from s1 and convert
++                ! to uppercase if it's a lowercase alpha character:
++                c1 = iachar(s1(s_idx:s_idx))
++                If (c_islower(c1) /= 0) c1 = c1 - 32
++                ! Get the ASCII code for the character from s2 and convert
++                ! to uppercase if it's a lowercase alpha character:
++                c2 = iachar(s2(s_idx:s_idx))
++                If (c_islower(c2) /= 0) c2 = c2 - 32
++                ! If the two characters differ, exit the loop now:
++                If (c1 /= c2) exit
++            End Do
++        Else
++            ! Fool the next bit of code into thinking we processed
++            ! both strings:
++            s_idx = s_min + 1
++        End If
++        ! If we finished the whole string, then c1 will still
++        ! equal c2, and the ordering is based on the lengths
++        ! alone...
++        If (s_idx > s_min) Then
++            fstring_casecmp = s2_len - s1_len
++        ! ...we didn't process the whole string, so ordering
++        ! is based on the characters we ended at:
++        Else
++            fstring_casecmp = c2 - c1
++        End If
++    End Function fstring_casecmp
++
++    !
++    ! @function fstring_in_list
++    !
++    ! Compare a Fortran string to a list of Fortran strings, optionally
++    ! ignoring alphabetic case according to ASCII encoding standards.
++    !
++    ! Returns .True. if the string, s, is exactly equivalent to a
++    ! string in the list, s_list.
++    !
++    Function fstring_in_list(s, s_list_len, s_list, is_caseless)
++        Implicit none
++        Logical :: fstring_in_list
++        Character(len=*), Intent(in) :: s
++        Integer, Intent(in) :: s_list_len
++        Character(len=*), Dimension(s_list_len) :: s_list
++        Logical, Optional :: is_caseless
++        
++        Integer :: s_list_idx, s_idx, s_len, s_list_count, c1, c2, tmp_len
++        Logical, Dimension(s_list_len) :: s_list_enable
++        Logical :: is_still_searching
++        
++        ! Shortcuts:
++        !     If there are no strings in the list, then there's
++        !     no possibility for a match:
++        If (s_list_len == 0) Then
++            fstring_in_list = .False.
++            Return
++        End If
++        !     If there is only one string in the list, then just
++        !     do a simple comparison (or a caseless one if
++        !     is_caseless is present and .true.):
++        If (s_list_len == 1) Then
++            If (Present(is_caseless)) Then
++                If (is_caseless) Then
++                    fstring_in_list = (fstring_casecmp(s, s_list(1)) == 0)
++                Else
++                    fstring_in_list = (trim(s) == trim(s_list(1)))
++                End If
++            Else
++                fstring_in_list = (trim(s) == trim(s_list(1)))
++            End If
++            Return
++        End If
++        fstring_in_list = .False.
++        
++        ! Get the length of the comparator string, s:
++        s_len = len_trim(s)
++        ! Now check each of the strings in the list to determine
++        ! how many match the length of s.  Fill-in the list of
++        ! lengths with zeroes for those that aren't the correct
++        ! size:
++        s_list_count = 0
++        Do s_list_idx = 1, s_list_len
++            tmp_len = len_trim(s_list(s_list_idx))
++            s_list_enable(s_list_idx) = (tmp_len == s_len)
++            If ( s_list_enable(s_list_idx) ) s_list_count = s_list_count + 1
++        End Do
++        
++        ! Are there any strings in the list which matched the
++        ! length?
++        If (s_list_count > 0) Then
++            ! Iterate over each character position:
++            Do s_idx = 1, s_len
++                ! Get the character from the comparator string and convert
++                ! to uppercase if is_caseless is present and .true.:
++                c1 = iachar(s(s_idx:s_idx))
++                If (Present(is_caseless)) Then
++                    If (is_caseless .and. c_islower(c1) /= 0) c1 = c1 - 32
++                End If
++                ! If any one of the strings in the list still match
++                ! the comparator string's character, this will be set
++                ! to .true. to continue the outer loop:
++                is_still_searching = .False.
++                ! Loop over the indices of strings in the list:
++                Do s_list_idx = 1, s_list_len
++                    ! If the string is still enabled, check its next character
++                    ! against the one from s:
++                    If (s_list_enable(s_list_idx)) Then
++                        ! Get the character from the string in the list and
++                        ! convert to uppercase if is_caseless is present and
++                        ! .true.:
++                        c2 = iachar(s_list(s_list_idx)(s_idx:s_idx))
++                        If (Present(is_caseless)) Then
++                            If (is_caseless .and. c_islower(c2) /= 0) c2 = c2 - 32
++                        End If
++                        ! If they're the same, make sure we keep matching...
++                        If (c1 == c2) Then
++                            If (s_idx == s_len) Then
++                                fstring_in_list = .True.
++                                Exit
++                            End If                            
++                            is_still_searching = .True.
++                        ! ...otherwise mark this string in the list as no
++                        ! longer enabled for search:
++                        Else
++                            s_list_enable(s_list_idx) = .False.
++                        End If
++                    End If
++                End Do
++                If (.not. is_still_searching) Exit
++            End Do
++        End If
++    End Function fstring_in_list
++    
++    !
++    ! @function fstring_char_is*
++    !
++    ! Functions that test the nature of an individual character.
++    ! The character argument to this function is converted to an
++    ! integer via iachar() and then passed to the c_is* function
++    ! of the same name.  The return value from that function is
++    ! mapped to a .True. (non-zero) or .False. (zero).
++    !
++    Function fstring_char_isalnum(c)
++        Implicit none
++        Logical :: fstring_char_isalnum
++        Character, Intent(In) :: c
++        fstring_char_isalnum = (c_isalnum(iachar(c)) /= 0)
++    End Function fstring_char_isalnum
++    !
++    Function fstring_char_isalpha(c)
++        Implicit none
++        Logical :: fstring_char_isalpha
++        Character, Intent(In) :: c
++        fstring_char_isalpha = (c_isalpha(iachar(c)) /= 0)
++    End Function fstring_char_isalpha
++    !
++    Function fstring_char_isascii(c)
++        Implicit none
++        Logical :: fstring_char_isascii
++        Character, Intent(In) :: c
++        fstring_char_isascii = (c_isascii(iachar(c)) /= 0)
++    End Function fstring_char_isascii
++    !
++    Function fstring_char_isblank(c)
++        Implicit none
++        Logical :: fstring_char_isblank
++        Character, Intent(In) :: c
++        fstring_char_isblank = (c_isblank(iachar(c)) /= 0)
++    End Function fstring_char_isblank
++    !
++    Function fstring_char_iscntrl(c)
++        Implicit none
++        Logical :: fstring_char_iscntrl
++        Character, Intent(In) :: c
++        fstring_char_iscntrl = (c_iscntrl(iachar(c)) /= 0)
++    End Function fstring_char_iscntrl
++    !
++    Function fstring_char_isdigit(c)
++        Implicit none
++        Logical :: fstring_char_isdigit
++        Character, Intent(In) :: c
++        fstring_char_isdigit = (c_isdigit(iachar(c)) /= 0)
++    End Function fstring_char_isdigit
++    !
++    Function fstring_char_isgraph(c)
++        Implicit none
++        Logical :: fstring_char_isgraph
++        Character, Intent(In) :: c
++        fstring_char_isgraph = (c_isgraph(iachar(c)) /= 0)
++    End Function fstring_char_isgraph
++    !
++    Function fstring_char_islower(c)
++        Implicit none
++        Logical :: fstring_char_islower
++        Character, Intent(In) :: c
++        fstring_char_islower = (c_islower(iachar(c)) /= 0)
++    End Function fstring_char_islower
++    !
++    Function fstring_char_isprint(c)
++        Implicit none
++        Logical :: fstring_char_isprint
++        Character, Intent(In) :: c
++        fstring_char_isprint = (c_isprint(iachar(c)) /= 0)
++    End Function fstring_char_isprint
++    !
++    Function fstring_char_ispunct(c)
++        Implicit none
++        Logical :: fstring_char_ispunct
++        Character, Intent(In) :: c
++        fstring_char_ispunct = (c_ispunct(iachar(c)) /= 0)
++    End Function fstring_char_ispunct
++    !
++    Function fstring_char_isspace(c)
++        Implicit none
++        Logical :: fstring_char_isspace
++        Character, Intent(In) :: c
++        fstring_char_isspace = (c_isspace(iachar(c)) /= 0)
++    End Function fstring_char_isspace
++    !
++    Function fstring_char_isupper(c)
++        Implicit none
++        Logical :: fstring_char_isupper
++        Character, Intent(In) :: c
++        fstring_char_isupper = (c_isupper(iachar(c)) /= 0)
++    End Function fstring_char_isupper
++    !
++    Function fstring_char_isxdigit(c)
++        Implicit none
++        Logical :: fstring_char_isxdigit
++        Character, Intent(In) :: c
++        fstring_char_isxdigit = (c_isxdigit(iachar(c)) /= 0)
++    End Function fstring_char_isxdigit
++    
++    
++    Function fstring_char_digittoint(c)
++        Implicit none
++        Integer :: fstring_char_digittoint
++        Character, Intent(In) :: c
++        
++        Integer :: charval
++        
++        charval = iachar(c)
++        If (c_isdigit(charval) /= 0) Then
++            fstring_char_digittoint = charval - iachar('0')
++        Else If (c_isxdigit(charval) /= 0) Then
++            If (c_isupper(charval) /= 0) Then
++                fstring_char_digittoint = 10 + (charval - iachar('A'))
++            Else
++                fstring_char_digittoint = 10 + (charval - iachar('a'))
++            End If
++        Else
++            fstring_char_digittoint = 0
++        End If
++    End Function fstring_char_digittoint
++
++    !
++    ! @subroutine fstring_tolower
++    !
++    ! Convert all characters in the string s to lowercase according to ASCII
++    ! encoding standards.
++    !
++    ! If s_out is present, the altered characters are copied to that string.
++    ! Otherwise, the characters in s_in are overwritten.
++    !
++    Subroutine fstring_tolower(s_in, s_out)
++        Implicit none
++        
++        Character(len=*), Intent(InOut) :: s_in
++        Character(len=*), Optional, Intent(Out) :: s_out
++        
++        Integer :: i, i_max
++        Integer :: c
++        
++        If (Present(s_out)) Then
++            ! Fill-in the s_out buffer with the characters
++            ! we process.  The length to process is whichever
++            ! of the two strings are smaller:
++            i_max = min(len_trim(s_in), len(s_out))
++            Do i = 1, i_max
++                ! Convert to code:
++                c = iachar(s_in(i:i))
++                ! Test for uppercase:
++                If (c_isupper(c) /= 0) Then
++                    ! Convert to lowercase and add to s_out:
++                    s_out(i:i) = achar(c + 32)
++                Else
++                    ! Add verbatim to s_out:
++                    s_out(i:i) = s_in(i:i)
++                End If
++            End Do
++            ! If s_out is larger than what we filled-in above,
++            ! then fill the rest of it with whitespace:
++            Do While (i <= len(s_out))
++                s_out(i:i) = ' '
++                i = i + 1
++            End Do
++        Else
++            i_max = len_trim(s_in)
++            Do i = 1, i_max
++                ! Convert to code:
++                c = iachar(s_in(i:i))
++                ! Test for uppercase:
++                If (c_isupper(c) /= 0) Then
++                    ! Convert to lowercase and overwrite s_in:
++                    s_in(i:i) = achar(c + 32)
++                End If
++            End Do
++        End If
++    End Subroutine fstring_tolower
++
++    !
++    ! @subroutine fstring_toupper
++    !
++    ! Convert all characters in the string s to uppercase according to ASCII
++    ! encoding standards.
++    !
++    ! If s_out is present, the altered characters are copied to that string.
++    ! Otherwise, the characters in s_in are overwritten.
++    !
++    Subroutine fstring_toupper(s_in, s_out)
++        Implicit none
++        
++        Character(len=*), Intent(InOut) :: s_in
++        Character(len=*), Optional, Intent(Out) :: s_out
++        
++        Integer :: i, i_max
++        Integer :: c
++        
++        If (Present(s_out)) Then
++            ! Fill-in the s_out buffer with the characters
++            ! we process.  The length to process is whichever
++            ! of the two strings are smaller:
++            i_max = min(len_trim(s_in), len(s_out))
++            Do i = 1, i_max
++                ! Convert to code:
++                c = iachar(s_in(i:i))
++                ! Test for uppercase:
++                If (c_islower(c) /= 0) Then
++                    ! Convert to uppercase and add to s_out:
++                    s_out(i:i) = achar(c - 32)
++                Else
++                    ! Add verbatim to s_out:
++                    s_out(i:i) = s_in(i:i)
++                End If
++            End Do
++            ! If s_out is larger than what we filled-in above,
++            ! then fill the rest of it with whitespace:
++            Do While (i <= len(s_out))
++                s_out(i:i) = ' '
++                i = i + 1
++            End Do
++        Else
++            i_max = len_trim(s_in)
++            Do i = 1, i_max
++                ! Convert to code:
++                c = iachar(s_in(i:i))
++                ! Test for uppercase:
++                If (c_islower(c) /= 0) Then
++                    ! Convert to uppercase and overwrite s_in:
++                    s_in(i:i) = achar(c - 32)
++                End If
++            End Do
++        End If
++    End Subroutine fstring_toupper
++    
++    !
++    ! @subroutine fstring_totitle
++    !
++    ! Convert all characters in the string s to titlecase according to ASCII
++    ! encoding standards.  Titlecase capitalizes the first letter of each
++    ! word.
++    !
++    ! If s_out is present, the altered characters are copied to that string.
++    ! Otherwise, the characters in s_in are overwritten.
++    !
++    Subroutine fstring_totitle(s_in, s_out)
++        Implicit none
++        
++        Character(len=*), Intent(InOut) :: s_in
++        Character(len=*), Optional, Intent(Out) :: s_out
++        
++        Integer :: i, i_max, charval, last_charval
++        Character :: c
++        
++        ! Remember the last character processed; we start with a space
++        ! character so that a leading word will get capitalized:
++        last_charval = ichar(' ')
++        If (Present(s_out)) Then
++            ! Fill-in the s_out buffer with the characters
++            ! we process.  The length to process is whichever
++            ! of the two strings are smaller:
++            i_max = min(len_trim(s_in), len(s_out))
++            Do i = 1, i_max
++                ! Get the next character and convert to code:
++                c = s_in(i:i)
++                charval = iachar(c)
++                ! Is it an alphabetical character?
++                If (c_isalpha(charval) /= 0) Then
++                    ! Were we preceded by a whitespace character or
++                    ! punctuation character?
++                    If (c_isspace(last_charval) /= 0 .or. c_ispunct(last_charval) /= 0) Then
++                        ! Lowercase must be uppercased:
++                        If (c_islower(charval) /= 0) c = achar(charval - 32)
++                    ! Otherwise, uppercase must be lowercased:
++                    Else If (c_isupper(charval) /= 0) Then
++                        c = achar(charval + 32)
++                    End If
++                End If
++                ! Push the current character to s_out:
++                s_out(i:i) = c
++                ! Note the last character code (we may have altered case,
++                ! but that doesn't matter):
++                last_charval = charval
++            End Do
++            ! If s_out is larger than what we filled-in above,
++            ! then fill the rest of it with whitespace:
++            Do While (i <= len(s_out))
++                s_out(i:i) = ' '
++                i = i + 1
++            End Do
++        Else
++            i_max = len_trim(s_in)
++            Do i = 1, i_max
++                ! Get the next character and convert to code:
++                c = s_in(i:i)
++                charval = iachar(c)
++                ! Is it an alphabetical character?
++                If (c_isalpha(charval) /= 0) Then
++                    ! Were we preceded by a whitespace character or
++                    ! punctuation character?
++                    If (c_isspace(last_charval) /= 0 .or. c_ispunct(last_charval) /= 0) Then
++                        ! Lowercase must be uppercased:
++                        If (c_islower(charval) /= 0) c = achar(charval - 32)
++                    ! Otherwise, uppercase must be lowercased:
++                    Else If (c_isupper(charval) /= 0) Then
++                        c = achar(charval + 32)
++                    End If
++                End If
++                ! Push the current character back to s_in:
++                s_in(i:i) = c
++                ! Note the last character code (we may have altered case,
++                ! but that doesn't matter):
++                last_charval = charval
++            End Do
++        End If
++    End Subroutine fstring_totitle
++    
++    !
++    ! @function fstring_parse_<type>
++    !
++    ! Attempt to parse a typed value from the given Fortran character
++    ! string, s.  If successful, out_value is set and .True. is
++    ! returned.  Otherwise, .False. is returned.
++    !
++    Function fstring_parse_integer1(s, out_value)
++        Implicit none
++        Logical :: fstring_parse_integer1
++        Character(len=*), Intent(in) :: s
++        Integer(1), Intent(out) :: out_value
++        Integer :: ierr
++        
++        Read(s, *, iostat=ierr) out_value
++        fstring_parse_integer1 = (ierr == 0)
++    End Function fstring_parse_integer1
++    !
++    Function fstring_parse_integer2(s, out_value)
++        Implicit none
++        Logical :: fstring_parse_integer2
++        Character(len=*), Intent(in) :: s
++        Integer(2), Intent(out) :: out_value
++        Integer :: ierr
++        
++        Read(s, *, iostat=ierr) out_value
++        fstring_parse_integer2 = (ierr == 0)
++    End Function fstring_parse_integer2
++    !
++    Function fstring_parse_integer4(s, out_value)
++        Implicit none
++        Logical :: fstring_parse_integer4
++        Character(len=*), Intent(in) :: s
++        Integer(4), Intent(out) :: out_value
++        Integer :: ierr
++        
++        Read(s, *, iostat=ierr) out_value
++        fstring_parse_integer4 = (ierr == 0)
++    End Function fstring_parse_integer4
++    !
++    Function fstring_parse_integer8(s, out_value)
++        Implicit none
++        Logical :: fstring_parse_integer8
++        Character(len=*), Intent(in) :: s
++        Integer(8), Intent(out) :: out_value
++        Integer :: ierr
++        
++        Read(s, *, iostat=ierr) out_value
++        fstring_parse_integer8 = (ierr == 0)
++    End Function fstring_parse_integer8
++    !
++    Function fstring_parse_real4(s, out_value)
++        Implicit none
++        Logical :: fstring_parse_real4
++        Character(len=*), Intent(in) :: s
++        Real(4), Intent(out) :: out_value
++        Integer :: ierr
++        
++        Read(s, *, iostat=ierr) out_value
++        fstring_parse_real4 = (ierr == 0)
++    End Function fstring_parse_real4
++    !
++    Function fstring_parse_real8(s, out_value)
++        Implicit none
++        Logical :: fstring_parse_real8
++        Character(len=*), Intent(in) :: s
++        Real(8), Intent(out) :: out_value
++        Integer :: ierr
++        
++        Read(s, *, iostat=ierr) out_value
++        fstring_parse_real8 = (ierr == 0)
++    End Function fstring_parse_real8
++    !
++    Function fstring_parse_logical(s, out_value)
++        Implicit none
++        Logical :: fstring_parse_logical
++        Character(len=*), Intent(in) :: s
++        Logical, Intent(out) :: out_value
++        Integer :: ierr, int_val
++        
++        Read(s, *, iostat=ierr) int_val
++        If (ierr == 0) Then
++            out_value = (int_val /= 0)
++            fstring_parse_logical = .True.
++        Else If (fstring_in_list(trim(s), Size(FSTRING_TRUE_STRINGS), FSTRING_TRUE_STRINGS, .True.)) Then
++            out_value = .True.
++            fstring_parse_logical = .True.
++        Else If (fstring_in_list(trim(s), Size(FSTRING_FALSE_STRINGS), FSTRING_FALSE_STRINGS, .True.)) Then
++            out_value = .False.
++            fstring_parse_logical = .True.
++        Else
++            fstring_parse_logical = .False.
++        End If
++    End Function fstring_parse_logical
++
++End Module
++
++#ifdef WANT_FSTRING_TEST_PROGRAM
++
++Program fstring_test
++    Use fstring
++    Implicit none
++    
++    Integer(1) :: i1
++    Integer(2) :: i2
++    Integer(4) :: i4
++    Integer(8) :: i8
++    Real(4) :: r4
++    Real(8) :: r8
++    Logical :: is_ok, lval
++    Character(len=12) :: s1, s2
++    Character(len=64) :: text = 'Now is the winter of our discontent--weep, all who care.'
++
++    Write(*,*) 'yes in list [YES, Y], case sensitive:', fstring_in_list('yes', 2, (/'YES', 'Y  '/))
++    Write(*,*) 'true in list [YES, Y, TRUE, T, ON], case insensitive:', fstring_in_list('true', 5, &
++                     (/'YES   ', 'Y     ', 'TRUE  ', 'T     ', 'ON    '/), .True.)
++    Write(*,*) 'ON in list [YES, Y, TRUE, T, ON], case insensitive:', fstring_in_list('ON', 5, &
++                     (/'YES   ', 'Y     ', 'TRUE  ', 'T     ', 'ON    '/), .True.)
++    Write(*,*) 'YeS in list [YES, Y, TRUE, T, ON], case insensitive:', fstring_in_list('YeS', 5, &
++                     (/'YES   ', 'Y     ', 'TRUE  ', 'T     ', 'ON    '/), .True.)
++    write(*,*)
++    
++    s1 = 'Lowercase'
++    s2 = ''
++    Write(*,*) '           s1 = ', s1, '  s2 = ', s2
++    Call fstring_toupper(s1)
++    Write(*,*) '[In-place] s1 = ', s1, '  s2 = ', s2
++    Call fstring_tolower(s1, s2)
++    Write(*,*) '[To-other] s1 = ', s1, '  s2 = ', s2
++    Call fstring_totitle(s1)
++    Write(*,*) '[To-title] s1 = ', s1, '  s2 = ', s2
++    Write(*,*)
++    
++    Write(*,*) '[Original] ', text
++    Call fstring_totitle(text)
++    Write(*,*) '[To-title] ', text
++    Write(*,*)
++    
++    Write(*,*) 'Integer value of digit `2` = ', fstring_char_digittoint('2')
++    Write(*,*) 'Integer value of digit `8` = ', fstring_char_digittoint('8')
++    Write(*,*) 'Integer value of digit `D` = ', fstring_char_digittoint('D')
++    Write(*,*) 'Integer value of digit `f` = ', fstring_char_digittoint('f')
++    Write(*,*) 'Integer value of digit `G` = ', fstring_char_digittoint('G')
++    Write(*,*)
++    
++    If ( fstring_parse('12', lval) ) write(*,*) '12 was true: ', lval
++    If ( fstring_parse('0', lval) ) write(*,*) '0 was true: ', lval
++    If ( fstring_parse('true', lval) ) write(*,*) 'true was true: ', lval
++    If ( fstring_parse('off', lval) ) write(*,*) 'off was true: ', lval
++    write(*,*)
++    
++    If ( fstring_parse('1', i1) ) write(*,*) 'i1 = ', i1
++    If ( fstring_parse('-45', i1) ) write(*,*) 'i1 = ', i1
++    If ( fstring_parse('-127', i1) ) write(*,*) 'i1 = ', i1
++    write(*,*)
++    If ( fstring_parse('32767', i2) ) write(*,*) 'i2 = ', i2
++    If ( fstring_parse('289542784', i2) ) write(*,*) 'i2 = ', i2
++    If ( fstring_parse('308569142531854976', i2) ) write(*,*) 'i2 = ', i2
++    write(*,*)
++    If ( fstring_parse('32767', i4) ) write(*,*) 'i4 = ', i4
++    If ( fstring_parse('289542784', i4) ) write(*,*) 'i4 = ', i4
++    If ( fstring_parse('308569142531854976', i4) ) write(*,*) 'i4 = ', i4
++    write(*,*)
++    If ( fstring_parse('32767', i8) ) write(*,*) 'i8 = ', i8
++    If ( fstring_parse('289542784', i8) ) write(*,*) 'i8 = ', i8
++    If ( fstring_parse('308569142531854976', i8) ) write(*,*) 'i8 = ', i8
++    write(*,*)
++    
++    If ( fstring_parse('3.141592653589793', r4) ) write(*,*) 'r4 = ', r4
++    If ( fstring_parse('3.141592653589793', r8) ) write(*,*) 'r8 = ', r8
++    write(*,*)
++    
++End Program fstring_test
++
++#endif
+diff -Naur A/mpi.F B/mpi.F
+--- A/mpi.F	2024-03-19 05:18:09.000000000 -0400
++++ B/mpi.F	2024-12-13 12:21:43.000000000 -0500
+@@ -129,28 +129,141 @@
  #ifdef MPI_INPLACE
  ! FIXME: check what M_cycle_d does with the intermediate array.
  ! REDUCEALL routines no longer use intermediate arrays
@@ -45,16 +1619,15 @@
 +      ! Private (internal) instance variables for the dynamic MPI_BLOCK
 +      ! implementation:
 +      LOGICAL, PRIVATE :: Is_MPI_BLOCK_inited = .FALSE.
++      LOGICAL :: SHOULD_USE_CHUNKED_SUM_MASTER = .TRUE.
++      LOGICAL :: SHOULD_USE_ALLREDUCE_SUM_MASTER = .FALSE.
 +      INTEGER :: MPI_BLOCK_VALUE = MPI_BLOCK
 +      PRIVATE :: M_init_MPI_BLOCK
  
        CONTAINS
  
 +      SUBROUTINE M_init_MPI_BLOCK( COMM )
-+#if defined(HAVE_FORTRAN_2003) && defined(__INTEL_COMPILER)
-+          ! Intel compilers provide getenv() in the IFPORT module
-+          USE IFPORT
-+#endif
++          USE envvar
 +#if defined(IFC) || defined(MPI_WORK_ARRAY_EQUIVALENCE)
 +          USE ISO_C_BINDING
 +#endif
@@ -62,35 +1635,43 @@
 +          
 +          TYPE(communic) :: COMM
 +          INTEGER :: ENVVAR_VALUE_LEN, IERROR
-+          CHARACTER(LEN=255) :: ENVVAR_VALUE
++          LOGICAL :: LOGICAL_VAL
++          INTEGER :: INTEGER_VAL, ENVSTAT
 +          
 +          IF (.NOT. Is_MPI_BLOCK_inited) THEN
 +              ! Determine the value of MPI_BLOCK, either from the environment
 +              ! variable VASP_MPI_BLOCK or the compiled-in MPI_BLOCK macro.
 +              ! Only the root rank consults the environment and decides; it
-+              ! then distributes the chosen MPI_BLOCK to the other ranks:
++              ! then distributes the chosen MPI_BLOCK to the other ranks.
++              !
++              ! Also get the possible override of chunked vs. full reduce
++              ! in the M_sum_master_*() subroutines.
 +              IF (COMM%NODE_ME .EQ. 1) THEN
-+#ifdef HAVE_FORTRAN_2003
-+                  CALL GET_ENVIRONMENT_VARIABLE('VASP_MPI_BLOCK', ENVVAR_VALUE, ENVVAR_VALUE_LEN)
-+#else
-+                  CALL GETENV('VASP_MPI_BLOCK', ENVVAR_VALUE)
-+                  ENVVAR_VALUE = TRIM(ENVVAR_VALUE)
-+                  ENVVAR_VALUE_LEN = LEN_TRIM(ENVVAR_VALUE)
-+#endif
-+                  MPI_BLOCK_VALUE = 0
-+                  IF (ENVVAR_VALUE_LEN > 0) THEN
-+                      READ(ENVVAR_VALUE, *, iostat=IERROR) MPI_BLOCK_VALUE
-+                      IF (IERROR /= 0) THEN
-+                          WRITE(0,'(A,X,A)') ' Invalid VASP_MPI_BLOCK in environment:', ENVVAR_VALUE
-+                      ELSE
-+                          WRITE(0,'(A,X,I0,X,A)') ' Using MPI_BLOCK size', MPI_BLOCK_VALUE, 'word(s) from environment'
-+                       END IF
++                  SHOULD_USE_CHUNKED_SUM_MASTER = .not. envvar_test_logical('VASP_MPI_DISABLE_CHUNKED_SUM_MASTER')
++                  IF (SHOULD_USE_CHUNKED_SUM_MASTER) THEN
++                      WRITE(0,'(A)') ' Using chunked M_sum_master subroutine variants'
++                  ELSE
++                      WRITE(0,'(A)') ' Using full-dimension M_sum_master subroutine variants'
 +                  END IF
-+                  IF (MPI_BLOCK_VALUE <= 0) THEN
++                  SHOULD_USE_ALLREDUCE_SUM_MASTER = envvar_test_logical('VASP_MPI_ENABLE_ALLREDUCE_SUM_MASTER')
++                  IF (SHOULD_USE_ALLREDUCE_SUM_MASTER) THEN
++                      WRITE(0,'(A)') ' Using MPI_Allreduce() in M_sum_master subroutine variants'
++                  ELSE
++                      WRITE(0,'(A)') ' Using MPI_Reduce() to root in M_sum_master subroutine variants'
++                  END IF
++                  IF (envvar_get('VASP_MPI_BLOCK', INTEGER_VAL, envstat=ENVSTAT)) THEN
++                      MPI_BLOCK_VALUE = INTEGER_VAL
++                      WRITE(0,'(A,X,I0,X,A)') ' Using MPI_BLOCK size', MPI_BLOCK_VALUE, 'word(s) from environment'
++                  ELSE
++                      IF (ENVSTAT == ENVVAR_ERR_CONVERT_FAIL) THEN
++                        WRITE(0, '(A)') ' Invalid value in VASP_MPI_BLOCK (not an integer)'
++                      END IF
 +                      MPI_BLOCK_VALUE = MPI_BLOCK
 +                      WRITE(0,'(A,X,I0,X,A)') ' Using default MPI_BLOCK size', MPI_BLOCK_VALUE, 'word(s)'
 +                  END IF
 +              END IF
++              CALL MPI_bcast(SHOULD_USE_ALLREDUCE_SUM_MASTER, 1, MPI_logical, 0, COMM%MPI_COMM, IERROR)
++              CALL MPI_bcast(SHOULD_USE_CHUNKED_SUM_MASTER, 1, MPI_logical, 0, COMM%MPI_COMM, IERROR)
 +              CALL MPI_bcast(MPI_BLOCK_VALUE, 1, MPI_integer, 0, COMM%MPI_COMM, IERROR)
 +              
 +              ! Set dimensioning instance variables associated with MPI_BLOCK
@@ -149,7 +1730,7 @@
  !
  !> Common error handling for all MPI calls.
  !>
-@@ -240,6 +346,9 @@
+@@ -240,6 +353,9 @@
        CHECK_MPI_ERROR(ierror,'M_init','MPI_comm_size')
  
        COMM%IONODE = 1
@@ -159,7 +1740,7 @@
  
  #ifdef qd_emulate
        ! define a MPI_sum operation for qd_type
-@@ -970,6 +1079,18 @@
+@@ -970,6 +1086,18 @@
        CALL MPI_op_free( M_sum_qd_op, ierror )
        IF ( ierror /= MPI_success ) &
           CALL M_stop_ierr('M_exit: MPI_op_free returns: ',ierror)
@@ -178,7 +1759,7 @@
  
        CALL MPI_finalize( ierror )
        IF ( ierror /= MPI_success ) &
-@@ -3813,14 +3934,14 @@
+@@ -3813,14 +3941,14 @@
        INTEGER :: tag=201
        INTEGER :: request((COMM%NCPU-1)*2)
        INTEGER A_OF_STATUSES(MPI_STATUS_SIZE,(COMM%NCPU-1)*2)
@@ -195,7 +1776,7 @@
      DO block = 0, maxsnd_rcvcount-1, max_
        p        = 1 + block   ! pointer to the current block base address
        nstat    = 0
-@@ -4120,7 +4241,7 @@
+@@ -4120,7 +4248,7 @@
        INTEGER       :: in
        INTEGER       :: request((COMM%NCPU-1)*2)
        INTEGER A_OF_STATUSES(MPI_STATUS_SIZE,(COMM%NCPU-1)*2)
@@ -204,7 +1785,7 @@
        INTEGER       :: block, p, sndcount_
        INTEGER       :: actual_proc_group, com_proc_group, &
             proc_group, group_base, i_in_group, irequests
-@@ -4136,6 +4257,7 @@
+@@ -4136,6 +4264,7 @@
  
        sndcount = n/ COMM%NCPU
        rcvcount = n/ COMM%NCPU
@@ -212,7 +1793,7 @@
  
  !----------------------------------------------------------------------
  #if defined(use_collective) || defined(_OPENACC)
-@@ -4372,7 +4494,7 @@
+@@ -4372,7 +4501,7 @@
        INTEGER       :: request((COMM%NCPU-1)*2)
        INTEGER A_OF_STATUSES(MPI_STATUS_SIZE,(COMM%NCPU-1)*2)
  ! test_
@@ -221,7 +1802,7 @@
        INTEGER       :: max_
  ! test_
        INTEGER       :: block, p, sndcount_
-@@ -4472,7 +4594,7 @@
+@@ -4472,7 +4601,7 @@
        INTEGER       :: in
        INTEGER       :: request((COMM%NCPU-1)*2)
        INTEGER A_OF_STATUSES(MPI_STATUS_SIZE,(COMM%NCPU-1)*2)
@@ -230,7 +1811,7 @@
        INTEGER       :: block, p, sndcount_
        INTEGER       :: actual_proc_group, com_proc_group, &
             proc_group, group_base, i_in_group, irequests
-@@ -4482,6 +4604,7 @@
+@@ -4482,6 +4611,7 @@
  
        sndcount = n/ COMM%NCPU
        rcvcount = n/ COMM%NCPU
@@ -238,7 +1819,7 @@
  
  !----------------------------------------------------------------------
  #ifdef use_collective
-@@ -4899,12 +5022,10 @@
+@@ -4899,12 +5029,10 @@
  ! too large blocks are slower on the Pentium architecture
  ! probably due to caching
  !
@@ -252,7 +1833,7 @@
        ALLOCATE(vec_inter(mmax*COMM%NCPU))
  !----------------------------------------------------------------------
  #endif
-@@ -5011,11 +5132,11 @@
+@@ -5011,11 +5139,11 @@
  ! too large blocks are slower on the Pentium architecture
  ! probably due to caching
  !
@@ -266,7 +1847,7 @@
        IF (n/COMM%NCPU < 2147483648_qi8) THEN
  ! here the case that n/COMM%CPU still fits into the 32-bit INTEGER range ...
           n4=n/COMM%NCPU
-@@ -5116,12 +5237,10 @@
+@@ -5116,12 +5244,10 @@
  ! too large blocks are slower on the Pentium architecture
  ! probably due to caching
  !
@@ -280,7 +1861,7 @@
        ALLOCATE(vec_inter(mmax*COMM%NCPU))
  
        nsummed=0
-@@ -5192,10 +5311,12 @@
+@@ -5192,10 +5318,12 @@
  ! too large blocks are slower on the Pentium architecture
  ! probably due to caching
  !
@@ -294,7 +1875,7 @@
  
        IF (n/COMM%NCPU < 2147483648_qi8) THEN
  ! here the case that n/COMM%CPU still fits into the 32-bit INTEGER range ...
-@@ -5296,7 +5417,7 @@
+@@ -5296,7 +5424,7 @@
  #ifdef use_collective_sum
        CALL M_sumb_d(COMM, vec, 2*n)
  #else
@@ -303,7 +1884,7 @@
           CALL M_sumf_d(COMM, vec, 2*n)
        ELSE
           CALL M_sumb_d(COMM, vec, 2*n)
-@@ -5344,7 +5465,7 @@
+@@ -5344,7 +5472,7 @@
  #ifdef use_collective_sum
        CALL M_sumb_s(COMM, vec, 2*n)
  #else
@@ -312,7 +1893,7 @@
           CALL M_sumf_s(COMM, vec, 2*n)
        ELSE
           CALL M_sumb_s(COMM, vec, 2*n)
-@@ -5423,7 +5544,7 @@
+@@ -5423,7 +5551,7 @@
  #ifdef use_collective_sum
        CALL M_sumb_d(COMM, vec, n)
  #else
@@ -321,7 +1902,7 @@
           CALL M_sumf_d(COMM, vec, n)
        ELSE
           CALL M_sumb_d(COMM, vec, n)
-@@ -5472,7 +5593,7 @@
+@@ -5472,7 +5600,7 @@
        ENDIF
  #else
  ! ... and also here we need to take a bit care ...
@@ -330,7 +1911,7 @@
        IF (n>max_) THEN
  ! ... for safety we also have to call the "8" version here ...
           CALL M_sumf_d8(COMM, vec, n)
-@@ -5502,7 +5623,7 @@
+@@ -5502,7 +5630,7 @@
  #ifdef use_collective_sum
        CALL M_sumb_s(COMM, vec, n)
  #else
@@ -339,7 +1920,7 @@
           CALL M_sumf_s(COMM, vec, n)
        ELSE
           CALL M_sumb_s(COMM, vec, n)
-@@ -5542,8 +5663,8 @@
+@@ -5542,8 +5670,8 @@
           CALL M_sumb_s(COMM, vec, n4)
        ENDIF
  #else
@@ -350,14 +1931,247 @@
           CALL M_sumf_s8(COMM, vec, n)
        ELSE
           n4=n
-@@ -5569,8 +5690,8 @@
+@@ -5558,30 +5686,64 @@
+ !
+ !----------------------------------------------------------------------
  
+-      SUBROUTINE M_sum_master_d(COMM, vec, n)
++      SUBROUTINE M_sum_master_d(COMM, vec, n, is_to_all)
+       USE mpimy
+       IMPLICIT NONE
+ 
+-      TYPE(communic) COMM
+-      INTEGER n
+-      REAL(q) vec(n)
+-      INTEGER :: I,thisdata,ierror
+-
++      TYPE(communic),    INTENT(IN)     :: COMM
++      INTEGER,           INTENT(IN)     :: n
++      REAL(q),           INTENT(INOUT)  :: vec(n)
++      LOGICAL, OPTIONAL, INTENT(IN)     :: is_to_all
++      
++      INTEGER                           :: I,thisdata,ierror
++      LOGICAL                           :: use_to_all
++      
        IF (COMM%NCPU == 1 ) RETURN
- 
+-
 -      DO i=1,n,MPI_BLOCK
 -         thisdata=min(n-i+1,MPI_BLOCK)
-+      DO i=1,n,MPI_BLOCK_VALUE
-+         thisdata=min(n-i+1,MPI_BLOCK_VALUE)
+-
+-         CALL MPI_reduce( vec(i), DTMP_m(1), thisdata, &
+-                             MPI_double_precision, MPI_sum, &
+-                             0, COMM%MPI_COMM, ierror )
+-         CHECK_MPI_ERROR(ierror,'M_sum_master_d','MPI_reduce')
+-
+-         IF (COMM%NODE_ME==1) THEN
+-            vec(i:i+thisdata-1)=DTMP_m(1:thisdata)
+-         ENDIF
+-      END DO
+-
++      
++      IF (PRESENT(is_to_all)) THEN
++          use_to_all = is_to_all
++      ELSE
++          use_to_all = .False.
++      ENDIF
++      IF (use_to_all) THEN
++          IF (SHOULD_USE_CHUNKED_SUM_MASTER) THEN
++              DO i=1,n,MPI_BLOCK_VALUE
++                 thisdata=min(n-i+1,MPI_BLOCK_VALUE)
++
++                 CALL MPI_allreduce( vec(i), DTMP_m(1), thisdata, &
++                                     MPI_double_precision, MPI_sum, &
++                                     COMM%MPI_COMM, ierror )
++                 CHECK_MPI_ERROR(ierror,'M_sum_master_d','MPI_allreduce')
++                 vec(i:i+thisdata-1)=DTMP_m(1:thisdata)
++              END DO
++          ELSE
++             CALL MPI_allreduce( MPI_IN_PLACE, vec(1), n, &
++                                 MPI_double_precision, MPI_sum, &
++                                 COMM%MPI_COMM, ierror )
++             CHECK_MPI_ERROR(ierror,'M_sum_master_d','MPI_allreduce')
++          ENDIF
++      ELSE
++          IF (SHOULD_USE_CHUNKED_SUM_MASTER) THEN
++              DO i=1,n,MPI_BLOCK_VALUE
++                 thisdata=min(n-i+1,MPI_BLOCK_VALUE)
++
++                 CALL MPI_reduce( vec(i), DTMP_m(1), thisdata, &
++                                     MPI_double_precision, MPI_sum, &
++                                     0, COMM%MPI_COMM, ierror )
++                 CHECK_MPI_ERROR(ierror,'M_sum_master_d','MPI_reduce')
++
++                 IF (COMM%NODE_ME==1) THEN
++                    vec(i:i+thisdata-1)=DTMP_m(1:thisdata)
++                 ENDIF
++              END DO
++          ELSE
++             CALL MPI_reduce( MPI_IN_PLACE, vec(1), n, &
++                                 MPI_double_precision, MPI_sum, &
++                                 0, COMM%MPI_COMM, ierror )
++             CHECK_MPI_ERROR(ierror,'M_sum_master_d','MPI_reduce')
++          ENDIF
++      ENDIF
++      
+       END SUBROUTINE M_sum_master_d
  
-          CALL MPI_reduce( vec(i), DTMP_m(1), thisdata, &
-                              MPI_double_precision, MPI_sum, &
+ !----------------------------------------------------------------------
+@@ -5589,15 +5751,20 @@
+ !> performs a sum on n double complex numbers to master
+ !
+ !----------------------------------------------------------------------
+-      SUBROUTINE M_sum_master_z(COMM, vec, n)
++      SUBROUTINE M_sum_master_z(COMM, vec, n, is_to_all)
+       USE mpimy
+       IMPLICIT NONE
++      
++      TYPE(communic),    INTENT(IN)     :: COMM
++      INTEGER,           INTENT(IN)     :: n
++      REAL(q),           INTENT(INOUT)  :: vec(n)
++      LOGICAL, OPTIONAL, INTENT(IN)     :: is_to_all
+ 
+-      TYPE(communic) COMM
+-      INTEGER n
+-      REAL(q) vec(n)
+-
+-      CALL M_sum_master_d(COMM,vec,2*n)
++      IF (PRESENT(is_to_all)) THEN
++          CALL M_sum_master_d(COMM,vec,2*n,is_to_all)
++      ELSE
++          CALL M_sum_master_d(COMM,vec,2*n,.FALSE.)
++      ENDIF
+ 
+       END SUBROUTINE M_sum_master_z
+ 
+diff -Naur A/.objects B/.objects
+--- A/.objects	2024-03-19 05:18:07.000000000 -0400
++++ B/.objects	2024-12-09 22:35:18.000000000 -0500
+@@ -6,6 +6,8 @@
+ 	tutor.o \
+ 	version.o \
+ 	build_info.o \
++        fstring.o \
++        envvar.o \
+ 	command_line.o \
+ 	vhdf5_base.o \
+ 	incar_reader.o \
+diff -Naur A/scala.F B/scala.F
+--- A/scala.F	2024-03-19 05:18:08.000000000 -0400
++++ B/scala.F	2024-12-10 10:05:54.000000000 -0500
+@@ -289,6 +289,7 @@
+       USE reader_tags, ONLY: INCAR_F
+       USE tutor, ONLY: vtutor
+       USE incar_reader, ONLY: PROCESS_INCAR
++      USE envvar
+       IMPLICIT NONE
+ 
+       INTEGER :: NB_TOT, NRPLWV
+@@ -296,7 +297,7 @@
+     ! local
+       REAL(q) :: STORAGE_HAM, STORAGE_WAVE
+ 
+-      CHARACTER(LEN=256) :: ENVVAR_VALUE
++      CHARACTER(LEN=256) :: ERR_STR
+       INTEGER :: ENVVAR_STAT, IERR
+ 
+ #ifdef gammareal
+@@ -321,13 +322,11 @@
+       NB=16
+ #endif
+ 
+-      ! check and block size NB from environment
+-      CALL GET_ENVIRONMENT_VARIABLE("VASP_SCALA_NB", ENVVAR_VALUE, STATUS=ENVVAR_STAT)
+-
+-      IF (ENVVAR_STAT == 0) THEN
+-          READ(ENVVAR_VALUE,*,iostat=ENVVAR_STAT) NB
+-          IF (ENVVAR_STAT /= 0) THEN
+-              CALL vtutor%error("ERROR: INIT_SCALAAWARE: could not parse VASP_SCALA_NB value from env.")
++      ! try to get block size NB from environment
++      IF (.NOT. ENVVAR_GET("VASP_SCALA_NB", NB, ENVSTAT=ENVVAR_STAT)) THEN
++          IF (ENVVAR_STAT == ENVVAR_ERR_CONVERT_FAIL) THEN
++              CALL ENVVAR_ERR_STRING(ENVVAR_STAT, ERR_STR)
++              CALL vtutor%error("ERROR: INIT_SCALAAWARE: could not parse VASP_SCALA_NB value from env: " // ERR_STR)
+           ENDIF
+       ENDIF
+ 
+diff -Naur A/wave_mpi.F B/wave_mpi.F
+--- A/wave_mpi.F	2024-03-19 05:18:09.000000000 -0400
++++ B/wave_mpi.F	2024-12-13 07:00:25.000000000 -0500
+@@ -1448,6 +1448,7 @@
+       USE wave
+       USE wave_mpi
+       USE mpimy
++      USE envvar, only: envvar_test_logical
+       IMPLICIT NONE
+       TYPE (wavedes) :: WDES
+       TYPE (wavespin) :: W
+@@ -1465,10 +1466,13 @@
+                END IF
+             END DO
+          END DO
+-! Reduce and broadcast for simplicity. Really an allgather.
+-         CALLMPI( M_sum_master_z( WDES%COMM_KINTER, W%CELTOT, SIZE(W%CELTOT) ) )
+-         CALLMPI( M_bcast_z( WDES%COMM_KINTER, W%CELTOT, SIZE(W%CELTOT) ) )
+-
++! Reduce and broadcast for simplicity. Really an allreduce.
++         IF (SHOULD_USE_ALLREDUCE_SUM_MASTER) THEN
++             CALLMPI( M_sum_master_z( WDES%COMM_KINTER, W%CELTOT, SIZE(W%CELTOT), .TRUE.) )
++         ELSE
++             CALLMPI( M_sum_master_z( WDES%COMM_KINTER, W%CELTOT, SIZE(W%CELTOT), .FALSE.) )
++             CALLMPI( M_bcast_z( WDES%COMM_KINTER, W%CELTOT, SIZE(W%CELTOT) ) )
++         ENDIF
+          POP_ACC_EXEC_ON
+ 
+       ENDIF
+@@ -1487,6 +1491,7 @@
+       USE wave
+       USE wave_mpi
+       USE mpimy
++      USE envvar, only: envvar_test_logical
+       IMPLICIT NONE
+       TYPE (wavedes) :: WDES
+       TYPE (wavespin) :: W
+@@ -1504,10 +1509,13 @@
+                END IF
+             END DO
+          END DO
+-! Reduce and broadcast for simplicity. Really an allgather.
+-         CALLMPI( M_sum_master_d( WDES%COMM_KINTER, W%FERTOT, SIZE(W%FERTOT) ) )
+-         CALLMPI( M_bcast_d( WDES%COMM_KINTER, W%FERTOT, SIZE(W%FERTOT) ) )
+-
++! Reduce and broadcast for simplicity. Really an allreduce.
++         IF (SHOULD_USE_ALLREDUCE_SUM_MASTER) THEN
++             CALLMPI( M_sum_master_d( WDES%COMM_KINTER, W%FERTOT, SIZE(W%FERTOT), .TRUE.) )
++         ELSE
++             CALLMPI( M_sum_master_d( WDES%COMM_KINTER, W%FERTOT, SIZE(W%FERTOT), .FALSE.) )
++             CALLMPI( M_bcast_d( WDES%COMM_KINTER, W%FERTOT, SIZE(W%FERTOT) ) )
++         ENDIF
+          POP_ACC_EXEC_ON
+ 
+       ENDIF
+@@ -1526,6 +1534,7 @@
+       USE wave
+       USE wave_mpi
+       USE mpimy
++      USE envvar, only: envvar_test_logical
+       IMPLICIT NONE
+       TYPE (wavedes) :: WDES
+       TYPE (wavespin) :: W
+@@ -1543,10 +1552,13 @@
+                END IF
+             END DO
+          END DO
+-! Reduce and broadcast for simplicity. Really an allgather.
+-         CALLMPI( M_sum_master_d( WDES%COMM_KINTER, W%AUXTOT, SIZE(W%AUXTOT) ) )
+-         CALLMPI( M_bcast_d( WDES%COMM_KINTER, W%AUXTOT, SIZE(W%AUXTOT) ) )
+-
++! Reduce and broadcast for simplicity. Really an allreduce.
++         IF (SHOULD_USE_ALLREDUCE_SUM_MASTER) THEN
++             CALLMPI( M_sum_master_d(WDES%COMM_KINTER, W%AUXTOT, SIZE(W%AUXTOT), .TRUE.) )
++         ELSE
++             CALLMPI( M_sum_master_d( WDES%COMM_KINTER, W%AUXTOT, SIZE(W%AUXTOT), .FALSE.) )
++             CALLMPI( M_bcast_d( WDES%COMM_KINTER, W%AUXTOT, SIZE(W%AUXTOT) ) )
++         ENDIF
+          POP_ACC_EXEC_ON
+ 
+       ENDIF
