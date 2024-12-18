@@ -34,6 +34,8 @@ The patch can be reversed from the same working directory by adding the `-R` opt
 $ patch -p1 -R < «path-to-patch-file»
 ```
 
+If the Fortran compiler can target Fortran 2003 standards, the `HAVE_FORTRAN_2003` macro should be defined in the `Makefile.inc` used to build VASP.
+
 ## Setting MPI_BLOCK at runtime
 
 With this patch, the runtime dimension of the work arrays is communicated to the program via the `VASP_MPI_BLOCK` environment variable.  If unset, the compiled-in `MPI_BLOCK` is used:
@@ -71,3 +73,16 @@ The runtime output reflects this choice:
  vasp.6.4.2 20Jul23 (build Aug 25 2023 13:59:04) complex
     :
  ```
+
+## Altering the M_sum_master algorithm at runtime
+
+The `wave_mpi` module calls the legacy subroutine, `M_sum_master_<type>()`, where `<type>` is `d` or `z` for real versus complex type vectors.  The subroutine performs a reduction of a large vector across all ranks and broadcasts the result (held by the root rank) to all other ranks.  The internal documentation mistakenly labels this an allgather operation:  an allgather merges disparate ranges of data held by ranks into a larger array on all ranks — an `MPI_Gather()` followed by an `MPI_Bcast()`, in essence.  The action in `wave_mpi` is an `MPI_Reduce()` followed by an `MPI_Bcast()`, which equates with an allreduce:  the vector elements are summed across ranks and the results distributed to all ranks.
+
+The motivation for `M_sum_master_<type>()` appears to be the slower, higher-latency networks and ancient MPI libraries that were in use in the early days of HPC.  Likewise, there was no `MPI_Allreduce()` prior to the MPI 2.1 standard so when the code was originally written the `MPI_Reduce()` followed by `MPI_Bcast()` was the norm:  the introduction of `MPI_Allreduce()` was motivated by the prevalence of that code pattern in software.
+
+The code in this patch introduces algorithmic variats in `wave_mpi` and the underlying `M_sum_master_<type>()` controlled by environment variables.  The MPI root rank checks the variables and distributes the state to all other ranks (just as it does with the selected `MPI_BLOCK` size).
+
+| Variable                               | Default     | Discussion                                                                                                                  |
+| -------------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `VASP_MPI_DISABLE_CHUNKED_SUM_MASTER`  | Off/False/0 | When set to On/True/1, the vector will **not** be broken into chunks for the reduction.                                     |
+| `VASP_MPI_ENABLE_ALLREDUCE_SUM_MASTER` | Off/False/0 | When set to On/True/1, an `MPI_Allreduce()` will be used in lieu of `MPI_Reduce()` followed by `MPI_Bcast()`. |
